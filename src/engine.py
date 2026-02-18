@@ -169,33 +169,25 @@ class SolarVisionEngine:
     )
     def extract_serial_only(self, image_path: str, asset_type: str = "Solar Module") -> str:
         """
-        Specialized extraction for Serial Numbers.
-        Focuses ONLY on alphanumeric sequences, ignoring technical specs.
+        Specialized extraction for Serial Numbers with STRICT Validation.
+        Uses a 2-Pass Logic to prevent digit omission.
         """
-        try:
-            # Switch to Forensic Preprocessing to enhance contrast/sharpness for digit accuracy
-            base64_image = self._preprocess_forensic(image_path)
-            
-            # Focused Serial Number Prompt
+        def call_model(img_b64, rigorous=False):
+            intensity = "EXTREME" if rigorous else "HIGH"
             system_prompt = (
                 f"Your Task: Extract the SERIAL NUMBER from this {asset_type} photo.\n"
-                "CRITICAL: ACCURACY IS PARAMOUNT. DO NOT OMIT ANY DIGITS/CHARACTERS.\n\n"
-                "Target: A unique alphanumeric string identifying this specific unique unit.\n"
-                "Characteristics:\n"
-                "1. LENGTH: Usually 14-24 characters long (often ~16 chars). If you find a short string (e.g., 4-8 chars), it is likely a model number or date code, NOT the serial.\n"
-                "2. FORMAT: Alphanumeric.\n"
-                "3. LOCATION: Often below/next to a barcode or QR code.\n"
-                "4. ORIENTATION: Often VERTICAL (rotated 90°). You MUST be able to read text running bottom-to-top or top-to-bottom.\n"
-                "5. CONTEXT: Serial numbers are often STANDALONE strings (no label), whereas Model Numbers usually have a 'Model No:' label.\n\n"
-                "Rules:\n"
-                "- VERIFY EVERY CHARACTER: Treat this as a forensic extraction. Missing a single digit is a failure.\n"
-                "- CHECK ROTATION: If you see vertical text, read it carefully.\n"
-                "- IGNORE: Model numbers (e.g., 'JKM545M', 'CS3W'), electrical ratings (e.g., '545W', '1500V').\n"
-                "- IGNORE: Date codes (e.g., '2023-05') or manufacturer addresses.\n"
-                "- OUTPUT FORMAT: Return ONLY the raw serial number string. No JSON. No markdown. No labels like 'Serial:'.\n"
-                "- If unreadable/missing, return 'N/A'."
+                f"MODE: {intensity} PRECISION FORENSICS.\n\n"
+                "Target: A unique alphanumeric string identifying this unit.\n"
+                "CRITICAL VALIDATION RULES:\n"
+                "1. LENGTH CHECK: Solar serials are almost always 14-20 characters.\n"
+                "   - If you see a short string (e.g., '6723'), it is WRONG. Look for the longer string.\n"
+                "   - Example Format: '1646M6625L817662' (16 chars).\n"
+                "2. NO OMISSION: It is better to include a questionable character than to skip it. Do not drop leading/trailing zeros.\n"
+                "3. ORIENTATION: Text may be VERTICAL (rotated). Read carefully.\n"
+                "4. CONTEXT: Ignore 'Model No', 'Date', 'Rating'. Look for the UNLABELED barcode string.\n\n"
+                "OUTPUT FORMAT: Return ONLY the raw serial number. No JSON. No markdown."
             )
-
+            
             completion = self.client.chat.completions.create(
                 model=self.model_id,
                 messages=[
@@ -203,22 +195,48 @@ class SolarVisionEngine:
                         "role": "user",
                         "content": [
                             {"type": "text", "text": system_prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{base64_image}"
-                                }
-                            }
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
                         ]
                     }
                 ],
-                temperature=0.0, # Deterministic
-                max_tokens=50,
-                top_p=1,
+                temperature=0.0,
+                max_tokens=60,
                 stream=False
             )
-            
             return completion.choices[0].message.content.strip()
+
+        try:
+            # Pass 1: Standard Forensic Enhancement
+            base64_v1 = self._preprocess_forensic(image_path)
+            result_v1 = call_model(base64_v1, rigorous=False)
+            
+            clean_v1 = ''.join(filter(str.isalnum, result_v1))
+            
+            # Validation: If it looks good (14+ chars), accept it.
+            if len(clean_v1) >= 14:
+                return clean_v1
+                
+            # Pass 2: If result is suspicious (<14 chars), try 'Thresholding' to force B/W
+            # This helps if the image was too gray/washed out.
+            logger.info(f"Pass 1 result '{clean_v1}' suspicious. Retrying Pass 2...")
+            
+            with Image.open(image_path) as img:
+                img = ImageOps.exif_transpose(img).convert('L')
+                # Aggressive Thresholding (Binarization)
+                # Any pixel < 128 becomes 0 (black), else 255 (white)
+                img = img.point( lambda p: 255 if p > 100 else 0 )
+                
+                buffered = io.BytesIO()
+                img.save(buffered, format="JPEG")
+                base64_v2 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+                
+            result_v2 = call_model(base64_v2, rigorous=True)
+            clean_v2 = ''.join(filter(str.isalnum, result_v2))
+            
+            # Decision: Return the longest valid-looking string
+            if len(clean_v2) > len(clean_v1):
+                return clean_v2
+            return clean_v1 if clean_v1 else "N/A"
 
         except Exception as e:
             logger.error(f"Serial Extraction Failed: {str(e)}")
