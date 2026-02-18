@@ -52,7 +52,7 @@ class SolarVisionEngine:
                 "3. HIERARCHY: If data is grouped (e.g., inside a box or under a header), nest it in the JSON.\n"
                 "4. FULL COMPLETENESS: Capture every legible piece of text, including small print, headers, and footer codes.\n"
                 "5. VALUES: Preserve exact text as seen on the document.\n"
-                "6. VISION ENHANCEMENT: If the image is blurry, low-light, or hazy, use computer vision inference to reconstruct text. Treat this as a forensic analysis task to recover data from compromised visibility.\n\n"
+                "6. VISION ENHANCEMENT: If the image is blurry, low-light, or contains noise (glare, shadows, scratches), use computer vision inference to reconstruct text. Filter out visual artifacts and focus on the data. Treat this as a forensic analysis task to recover data from compromised visibility.\n\n"
                 "REQUIRED METADATA:\n"
                 "- 'document_type': Infer the specific type (e.g., 'Vehicle Registration', 'Invoice', 'Solar Label').\n"
                 "- 'human_detected': boolean (true ONLY if a full human person, face, or distinct body is visible. DO NOT set to true for hands, fingers, or nails holding a document).\n"
