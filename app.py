@@ -115,8 +115,13 @@ def main():
             if "error" in res:
                 st.error(f"❌ **Analysis Failed:** {res['error']}")
             else:
-                # Top Metrics Row
-                st.markdown("### 📊 **Intelligence Report**")
+                # Domain Validation Check
+                if res.get('domain_relevant') is False:
+                    st.error(f"⛔ **Domain Check Failed:** {res.get('rejection_reason', 'Image is not relevant to Solar, Documents, or Field operations.')}")
+                    st.warning("Please upload a valid asset (Solar Panel, Invoice, ID Card, Vehicle, Field Site).")
+                else:
+                    # Top Metrics Row
+                    st.markdown("### 📊 **Intelligence Report**")
                 
                 m1, m2, m3 = st.columns(3)
                 human_count = res.get('human_count', 0)
