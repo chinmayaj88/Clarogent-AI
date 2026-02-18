@@ -194,14 +194,8 @@ def main():
             st.info("👈 **Start Here:** Upload a document or image to begin forensic analysis.")
             st.markdown(
                 """
-                <div style="padding: 2rem; background: rgba(255,255,255,0.03); border-radius: 10px; border: 1px dashed rgba(255,255,255,0.1);">
-                    <h4 style="margin:0; color: #a0aec0;">Supported Use Cases</h4>
-                    <ul style="color: #718096; margin-top: 1rem;">
-                        <li>🚗 <strong>Vehicle Registration</strong> (RC)</li>
-                        <li>🆔 <strong>Government ID</strong> (Aadhaar, PAN, DL)</li>
-                        <li>☀️ <strong>Solar Asset</strong> (Panel Labels, Inverters)</li>
-                        <li>🧾 <strong>Financial</strong> (Invoices, Receipts)</li>
-                    </ul>
+                <div style="padding: 2rem; background: rgba(255,255,255,0.03); border-radius: 10px; border: 1px dashed rgba(255,255,255,0.1); display: flex; align-items: center; justify-content: center; height: 200px;">
+                    <h4 style="margin:0; color: #a0aec0;">Awaiting Document Upload</h4>
                 </div>
                 """, 
                 unsafe_allow_html=True
