@@ -5,14 +5,26 @@ import base64
 import os
 import requests
 import pandas as pd
+import threading
 from urllib.parse import urlparse, parse_qs
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from groq import Groq, RateLimitError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 import io
+import time
+
+# Import Prompts
+from src.prompts import (
+    UNIVERSAL_PARSER_PROMPT,
+    SERIAL_EXTRACTION_TEMPLATE,
+    SOLAR_MODULE_RULES,
+    GENERIC_ASSET_RULES,
+    COMMON_SERIAL_RULES,
+    HUMAN_DETECTION_PROMPT
+)
 
 # Configure Enterprise Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -25,6 +37,7 @@ class SolarVisionEngine:
     - Dynamic Document Parsing (Aadhaar, PAN, Solar Labels)
     - Rate Limiting with Exponential Backoff
     - Robust JSON Structure Enforcement
+    - Two-Pass Serial Extraction Logic (Raw -> Forensic)
     """
     
     def __init__(self, api_key: Optional[str] = None, model_id: str = "llama-3.2-90b-vision-preview"):
@@ -38,9 +51,20 @@ class SolarVisionEngine:
         self.model_id = os.getenv("GROQ_MODEL_ID", model_id)
 
     def _encode_image(self, image_path: str) -> str:
-        """Optimized Base64 encoding for image payloads."""
-        with open(image_path, "rb") as image_file:
-            return base64.b64encode(image_file.read()).decode('utf-8')
+        """Optimized Base64 encoding with aggressive resizing for speed."""
+        with Image.open(image_path) as img:
+            # Resize if too large (e.g. > 1280px) to reduce payload size
+            # This makes upload to Groq 3x faster
+            if img.width > 1280 or img.height > 1280:
+                img.thumbnail((1280, 1280))
+            
+            buffered = io.BytesIO()
+            # Convert to RGB to avoid mode issues with some formats
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+                
+            img.save(buffered, format="JPEG", quality=85)
+            return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
     def _preprocess_forensic(self, image_path: str) -> str:
         """
@@ -79,8 +103,8 @@ class SolarVisionEngine:
 
     @retry(
         retry=retry_if_exception_type(RateLimitError),
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10)
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=2, max=20)
     )
     def analyze_installation(self, image_path: str) -> Dict[str, Any]:
         """
@@ -91,35 +115,13 @@ class SolarVisionEngine:
         try:
             base64_image = self._encode_image(image_path)
             
-            # Universal Document Discovery Prompt (No Hardcoding)
-            # CRITICAL: Includes Human Detection, Quality Check, and Domain Validation
-            system_prompt = (
-                "ACT AS A UNIVERSAL DOCUMENT/IMAGE PARSER. Your task is to digitize this image into a structured JSON format.\n"
-                "RULES:\n"
-                "1. NO PRE-DEFINED SCHEMA: Extract whatever fields are naturally present in the image.\n"
-                "2. SMART KEYS: Convert visible labels to snake_case keys (e.g., 'Date of Birth' -> 'date_of_birth').\n"
-                "3. HIERARCHY: If data is grouped (e.g., inside a box or under a header), nest it in the JSON.\n"
-                "4. FULL COMPLETENESS: Capture every legible piece of text, including small print, headers, and footer codes.\n"
-                "5. VALUES: Preserve exact text as seen on the document.\n"
-                "6. VISION ENHANCEMENT: If the image is blurry, low-light, or contains noise (glare, shadows, scratches), use computer vision inference to reconstruct text. Filter out visual artifacts and focus on the data. Treat this as a forensic analysis task to recover data from compromised visibility.\n\n"
-                "7. DOMAIN VALIDATION: The system is restricted to: Solar Energy sites/equipment, Field Audits, Official Documents (IDs, Invoices, Datasheets), Vehicles, and Industrial settings. IF THE IMAGE IS IRRELEVANT (e.g., food, scenic landscapes, random selfies, pets), set 'domain_relevant' to false.\n\n"
-                "REQUIRED METADATA:\n"
-                "- 'document_type': Infer the specific type (e.g., 'Vehicle Registration', 'Invoice', 'Solar Label').\n"
-                "- 'domain_relevant': boolean (true if matches domain).\n"
-                "- 'rejection_reason': string (null if relevant, else brief reason).\n"
-                "- 'human_detected': boolean (true ONLY if a full human person, face, or distinct body is visible. DO NOT set to true for hands, fingers, or nails holding a document).\n"
-                "- 'human_count': integer (count only full people/faces, exclude hands holding items).\n\n"
-                "Output STRICTLY valid JSON. No markdown."
-            )
-
-            # Enterprise Implementation: Using Streaming for Real-time Latency Handling
             completion = self.client.chat.completions.create(
                 model=self.model_id,
                 messages=[
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": system_prompt},
+                            {"type": "text", "text": UNIVERSAL_PARSER_PROMPT},
                             {
                                 "type": "image_url",
                                 "image_url": {
@@ -132,15 +134,11 @@ class SolarVisionEngine:
                 temperature=0.1,           # Low temperature for deterministic output
                 max_tokens=1024,
                 top_p=1,
-                stream=True,               # Enabling Streaming
-                stop=None
+                stream=False               # DISABLED STREAMING for lower latency
             )
 
-            # Stream aggregation mechanism
-            full_response = ""
-            for chunk in completion:
-                content = chunk.choices[0].delta.content or ""
-                full_response += content
+            # Get full response immediately
+            full_response = completion.choices[0].message.content
                 
             logger.debug(f"Raw Model Output: {full_response[:100]}...")
 
@@ -164,29 +162,26 @@ class SolarVisionEngine:
 
     @retry(
         retry=retry_if_exception_type(RateLimitError),
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10)
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=2, max=20)
     )
     def extract_serial_only(self, image_path: str, asset_type: str = "Solar Module") -> str:
         """
         Specialized extraction for Serial Numbers with STRICT Validation.
-        Uses a 2-Pass Logic to prevent digit omission.
+        Uses a 2-Pass Logic (Raw -> Forensic) to Balance Speed and Accuracy.
         """
-        def call_model(img_b64, rigorous=False):
+        def call_model(img_b64: str, rigorous: bool = False) -> str:
             intensity = "EXTREME" if rigorous else "HIGH"
-            system_prompt = (
-                f"Your Task: Extract the SERIAL NUMBER from this {asset_type} photo.\n"
-                f"MODE: {intensity} PRECISION FORENSICS.\n\n"
-                "Target: A unique alphanumeric string identifying this unit.\n"
-                "CRITICAL VALIDATION RULES:\n"
-                "1. LENGTH CHECK: Solar serials are almost always 14-20 characters.\n"
-                "   - If you see a short string (e.g., '6723'), it is WRONG. Look for the longer string.\n"
-                "   - Example Format: '1646M6625L817662' (16 chars).\n"
-                "2. NO OMISSION: It is better to include a questionable character than to skip it. Do not drop leading/trailing zeros.\n"
-                "3. ORIENTATION: Text may be VERTICAL (rotated). Read carefully.\n"
-                "4. CONTEXT: Ignore 'Model No', 'Date', 'Rating'. Look for the UNLABELED barcode string.\n\n"
-                "OUTPUT FORMAT: Return ONLY the raw serial number. No JSON. No markdown."
-            )
+            
+            # Construct Prompt based on Asset Type
+            prompt = SERIAL_EXTRACTION_TEMPLATE.format(asset_type=asset_type, intensity=intensity)
+            
+            if asset_type == "Solar Module":
+                prompt += SOLAR_MODULE_RULES
+            else:
+                prompt += GENERIC_ASSET_RULES
+                
+            prompt += COMMON_SERIAL_RULES
             
             completion = self.client.chat.completions.create(
                 model=self.model_id,
@@ -194,7 +189,7 @@ class SolarVisionEngine:
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": system_prompt},
+                            {"type": "text", "text": prompt},
                             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
                         ]
                     }
@@ -206,48 +201,60 @@ class SolarVisionEngine:
             return completion.choices[0].message.content.strip()
 
         try:
-            # Pass 1: Standard Forensic Enhancement
-            base64_v1 = self._preprocess_forensic(image_path)
+            # Pass 1: RAW IMAGE (Best for modern VLMs like Llama 3.2)
+            # We explicitly AVOID pre-processing here to let the model see the natural image.
+            # Convert raw file to base64
+            base64_v1 = self._encode_image(image_path)
             result_v1 = call_model(base64_v1, rigorous=False)
             
             clean_v1 = ''.join(filter(str.isalnum, result_v1))
             
-            # Validation: If it looks good (14+ chars), accept it.
-            if len(clean_v1) >= 14:
-                return clean_v1
+            # Validation Logic
+            if asset_type == "Solar Module":
+                # STRICT 16-digit rule for Modules (Immediate Success)
+                if len(clean_v1) == 16:
+                    return clean_v1
+            else:
+                # Flexible rule for Inverters/Others
+                if len(clean_v1) >= 10: 
+                    return clean_v1
                 
-            # Pass 2: If result is suspicious (<14 chars), try 'Thresholding' to force B/W
-            # This helps if the image was too gray/washed out.
-            logger.info(f"Pass 1 result '{clean_v1}' suspicious. Retrying Pass 2...")
+            # Pass 2: If Raw Image failed strict validation, try 'Forensic Enhancement'
+            # This is our fallback for bad lighting/low contrast.
+            logger.info(f"Pass 1 (Raw) result '{clean_v1}' suspicious. Retrying Pass 2 (Forensic)...")
             
-            with Image.open(image_path) as img:
-                img = ImageOps.exif_transpose(img).convert('L')
-                # Aggressive Thresholding (Binarization)
-                # Any pixel < 128 becomes 0 (black), else 255 (white)
-                img = img.point( lambda p: 255 if p > 100 else 0 )
-                
-                buffered = io.BytesIO()
-                img.save(buffered, format="JPEG")
-                base64_v2 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-                
-            result_v2 = call_model(base64_v2, rigorous=True)
+            # Use the forensic pre-processor (Grayscale + Contrast + Sharpness)
+            base64_v2 = self._preprocess_forensic(image_path)
+            result_v2 = call_model(base64_v2, rigorous=True) # Send base64 directly
             clean_v2 = ''.join(filter(str.isalnum, result_v2))
             
-            # Decision: Return the longest valid-looking string
-            if len(clean_v2) > len(clean_v1):
-                return clean_v2
-            return clean_v1 if clean_v1 else "N/A"
+            # Final Decision
+            if asset_type == "Solar Module":
+                if len(clean_v2) == 16:
+                    return clean_v2
+                
+                # If neither passed strict check, use heuristics
+                diff_v1 = abs(len(clean_v1) - 16)
+                diff_v2 = abs(len(clean_v2) - 16)
+                
+                # Return closest to 16
+                if diff_v1 <= diff_v2 and clean_v1:
+                    return clean_v1
+                return clean_v2 if clean_v2 else (clean_v1 if clean_v1 else "N/A")
+            else:
+                # Standard logic (Longest plausible string)
+                if len(clean_v2) > len(clean_v1):
+                    return clean_v2
+                return clean_v1 if clean_v1 else "N/A"
 
         except Exception as e:
             logger.error(f"Serial Extraction Failed: {str(e)}")
             return "Error"
 
-
-
     @retry(
         retry=retry_if_exception_type(RateLimitError),
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10)
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=2, max=20)
     )
     def detect_human(self, image_path: str) -> bool:
         """
@@ -256,12 +263,6 @@ class SolarVisionEngine:
         """
         try:
             base64_image = self._encode_image(image_path)
-            system_prompt = (
-                "Do you see a HUMAN PERSON in this image? "
-                "Look for full bodies, faces, or distinct body parts (arms/legs). "
-                "Ignore hands/fingers holding the camera or document. "
-                "Reply ONLY with 'YES' or 'NO'."
-            )
             
             completion = self.client.chat.completions.create(
                 model=self.model_id,
@@ -269,7 +270,7 @@ class SolarVisionEngine:
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": system_prompt},
+                            {"type": "text", "text": HUMAN_DETECTION_PROMPT},
                             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
                         ]
                     }
@@ -287,16 +288,27 @@ class SolarVisionEngine:
 class BatchProcessor:
     """
     Handles bulk processing of Excel sheets containing Google Drive links.
-    Integrates with SolarVisionEngine for row-by-row analysis.
+    Features:
+    - Thread-safe Write Operations (concurrent.futures friendly)
+    - Connection Pooling (requests.Session)
+    - Integrates with SolarVisionEngine for row-by-row analysis.
     """
     def __init__(self, excel_path: str, api_key: Optional[str] = None, model_id: str = "llama-3.2-90b-vision-preview"):
         self.excel_path = excel_path
         # Initialize Engine (it handles env variable fallback)
         self.engine = SolarVisionEngine(api_key=api_key, model_id=model_id)
         
+        # Thread Safety Lock for concurrent writes
+        self.write_lock = threading.Lock()
+        
+        # Connection Pool Session for faster downloads
+        self.session = requests.Session()
+        
         # Load Excel with Pandas for processing logic
         try:
             self.df = pd.read_excel(excel_path)
+            # FIX: Cast all to object to prevent "incompatible dtype" warnings when writing strings to empty float columns
+            self.df = self.df.astype(object)
             
             # Load Excel with OpenPyXL for style preservation
             self.wb = load_workbook(excel_path)
@@ -346,7 +358,7 @@ class BatchProcessor:
             raise
 
     def _update_xl(self, row_idx, col_name, value):
-        """Updates the OpenPyXL worksheet cell, preserving style."""
+        """Updates the OpenPyXL worksheet cell, preserving style. Thread-safe."""
         try:
             # Pandas index is 0-based. Excel rows are 1-based.
             # Usually row 1 is header. So data starts at row 2.
@@ -355,7 +367,8 @@ class BatchProcessor:
             
             if col_name in self.col_map_xl:
                 xl_col = self.col_map_xl[col_name]
-                self.ws.cell(row=xl_row, column=xl_col).value = value
+                with self.write_lock:
+                    self.ws.cell(row=xl_row, column=xl_col).value = value
         except Exception as e:
             logger.warning(f"Failed to update Excel cell: {e}")
 
@@ -382,22 +395,30 @@ class BatchProcessor:
         return None
 
     def _download_image(self, drive_id: str, save_path: str) -> bool:
-        """Downloads image from Google Drive using ID."""
+        """Downloads image from Google Drive using ID and Connection Pooling."""
         url = f"https://drive.google.com/uc?export=download&id={drive_id}"
         try:
-            response = requests.get(url, stream=True)
+            # Use self.session for pooled connection
+            response = self.session.get(url, stream=True, timeout=10)
             if response.status_code == 200:
                 with open(save_path, 'wb') as f:
                     for chunk in response.iter_content(1024):
                         f.write(chunk)
-                return True
+                
+                # Validate that we actually downloaded an image (not an HTML error page)
+                try:
+                    with Image.open(save_path) as img:
+                        img.verify() # Simple check for corruption
+                    return True
+                except Exception:
+                    logger.warning(f"Downloaded file {drive_id} is not a valid image.")
+                    return False
             else:
                 logger.warning(f"Failed to download image: {drive_id} (Status: {response.status_code})")
                 return False
         except Exception as e:
             logger.error(f"Error downloading image {drive_id}: {e}")
             return False
-
 
     def process_solar_audit_row(self, index, row, status_callback=None):
         """
@@ -408,6 +429,7 @@ class BatchProcessor:
         """
         cols = row.index.tolist()
         count = 0
+        audit_remarks = []
         
         # --- Helper 1: Process Serial Number Pairs ---
         def process_pair(photo_col, target_col, asset_type):
@@ -418,37 +440,45 @@ class BatchProcessor:
             drive_id = self._get_drive_id(img_url)
             if not drive_id:
                 val = "Invalid Link"
-                self.df.at[index, target_col] = val
+                with self.write_lock:
+                    self.df.at[index, target_col] = val
                 self._update_xl(index, target_col, val)
+                audit_remarks.append(f"{target_col}: Invalid Link")
                 return False
                 
-            temp_path = f"temp_{asset_type.replace(' ','_')}_{index}.jpg"  
-            if self._download_image(drive_id, temp_path):
-                serial = self.engine.extract_serial_only(temp_path, asset_type)
-                self.df.at[index, target_col] = serial
+            test_path = f"temp_{asset_type.replace(' ','_')}_{index}.jpg"  
+            if self._download_image(drive_id, test_path):
+                serial = self.engine.extract_serial_only(test_path, asset_type)
+                with self.write_lock:
+                    self.df.at[index, target_col] = serial
                 self._update_xl(index, target_col, serial)
-                if os.path.exists(temp_path): os.remove(temp_path)
+                
+                if serial == "Error":
+                    audit_remarks.append(f"{target_col}: Extraction Error")
+                
+                if os.path.exists(test_path): os.remove(test_path)
                 return True
             else:
                  val = "Download Failed"
-                 self.df.at[index, target_col] = val
+                 with self.write_lock:
+                     self.df.at[index, target_col] = val
                  self._update_xl(index, target_col, val)
+                 audit_remarks.append(f"{target_col}: Download Failed")
                  return False
 
         # --- Helper 2: Check Human Presence ---
         human_detected_overall = False
-        human_audit_remarks = []
 
         def check_human_in_col(col_name, label):
             nonlocal human_detected_overall
             img_url = row.get(col_name)
             if not img_url or pd.isna(img_url):
-                human_audit_remarks.append(f"{label}: Not Present")
+                audit_remarks.append(f"{label}: Not Present")
                 return
 
             drive_id = self._get_drive_id(img_url)
             if not drive_id:
-                human_audit_remarks.append(f"{label}: Invalid Link")
+                audit_remarks.append(f"{label}: Invalid Link")
                 return
 
             temp_path = f"temp_human_{index}_{label}.jpg"
@@ -456,16 +486,13 @@ class BatchProcessor:
                 has_human = self.engine.detect_human(temp_path)
                 if has_human:
                     human_detected_overall = True
-                    human_audit_remarks.append(f"{label}: Human Found")
+                    audit_remarks.append(f"{label}: Human Found")
                 else:
-                    human_audit_remarks.append(f"{label}: Clear")
+                    audit_remarks.append(f"{label}: Clear")
                 
                 if os.path.exists(temp_path): os.remove(temp_path)
             else:
-                human_audit_remarks.append(f"{label}: Download Failed")
-
-        # --- Execution Limit Check ---
-        # (Assuming limits handled elsewhere or user pays)
+                audit_remarks.append(f"{label}: Download Failed")
 
         # 1. Iterate columns for Serial Numbers
         for col in cols:
@@ -479,13 +506,9 @@ class BatchProcessor:
             
             # B. Inverter Serial Numbers
             elif "Inverter Serial Number Photo" in col:
-                # Find Target: AI Inverter Serial Number
-                # Handle potential suffix if multiple inverters exist
                 suffix = col.replace("Inverter Serial Number Photo", "").strip()
-                # Target is usually "AI Inverter Serial Number" (singular) or with suffix
                 target_candidates = [c for c in cols if f"AI Inverter Serial Number{suffix}" in c]
                 if not target_candidates:
-                     # Fallback to generic if no suffix match
                      target_candidates = [c for c in cols if "AI Inverter Serial Number" in c]
                 
                 if target_candidates:
@@ -503,14 +526,16 @@ class BatchProcessor:
         human_col_candidates = [c for c in cols if "Human Detected" in c]
         if human_col_candidates:
             val = "YES" if human_detected_overall else "NO"
-            self.df.at[index, human_col_candidates[0]] = val
+            with self.write_lock:
+                self.df.at[index, human_col_candidates[0]] = val
             self._update_xl(index, human_col_candidates[0], val)
 
         # 4. Update Remarks
-        remarks_col_candidates = [c for c in cols if "AI Remarks" in c]
-        if remarks_col_candidates and human_audit_remarks:
-            val = " | ".join(human_audit_remarks)
-            self.df.at[index, remarks_col_candidates[0]] = val
+        remarks_col_candidates = [c for c in cols if "ai remarks" in c.lower()]
+        if remarks_col_candidates and audit_remarks:
+            val = " | ".join(audit_remarks)
+            with self.write_lock:
+                self.df.at[index, remarks_col_candidates[0]] = val
             self._update_xl(index, remarks_col_candidates[0], val)
 
         if status_callback:
@@ -520,10 +545,10 @@ class BatchProcessor:
                 status_callback(f"⚠️ Row {index+1}: Processed (No Serials Found)")
 
     def process_row(self, index, row, img_col, human_col, ai_remarks_col, data_col, status_callback=None):
-        """Processes a single row."""
+        """Processes a single row for generic documents."""
         # ... (Old Logic - Unchanged) ...
         image_url = row.get(img_col)
-        # Re-insert the start of the original method to ensure it's still available for generic mode
+        
         if not image_url or pd.isna(image_url):
             logger.info(f"Row {index}: No image URL found. Skipping.")
             return
@@ -543,14 +568,16 @@ class BatchProcessor:
                 # Check for errors
                 if "error" in result:
                     val = f"Error: {result['error']}"
-                    self.df.at[index, ai_remarks_col] = val
+                    with self.write_lock:
+                        self.df.at[index, ai_remarks_col] = val
                     self._update_xl(index, ai_remarks_col, val)
                     
                     if status_callback: status_callback(f"⚠️ Row {index+1}: Vision Error")
                 else:
                     # Fill columns
                     human_detected_val = "YES" if result.get('human_detected', False) else "NO"
-                    self.df.at[index, human_col] = human_detected_val
+                    with self.write_lock:
+                        self.df.at[index, human_col] = human_detected_val
                     self._update_xl(index, human_col, human_detected_val)
                     
                     # AI Remarks Logic
@@ -559,7 +586,6 @@ class BatchProcessor:
                         remarks.append(f"Irrelevant: {result.get('rejection_reason', 'Unknown')}")
                     
                     remarks.append(f"Type: {result.get('document_type', 'Unknown')}")
-                    remarks.append(f"Confidence: {result.get('confidence', 'N/A')}")
                     
                     # Human Count
                     h_count = result.get('human_count', 0)
@@ -567,15 +593,16 @@ class BatchProcessor:
                          remarks.append(f"Humans: {h_count}")
 
                     remarks_val = " | ".join(remarks)
-                    self.df.at[index, ai_remarks_col] = remarks_val
+                    with self.write_lock:
+                        self.df.at[index, ai_remarks_col] = remarks_val
                     self._update_xl(index, ai_remarks_col, remarks_val)
                     
                     # Extracted Data (JSON Dump or Summary)
-                    # Filter out metadata keys for cleaner data
                     excluded_keys = ['document_type', 'domain_relevant', 'rejection_reason', 'human_detected', 'human_count', 'confidence', 'error']
                     data_only = {k: v for k, v in result.items() if k not in excluded_keys}
                     data_val = str(data_only)
-                    self.df.at[index, data_col] = data_val
+                    with self.write_lock:
+                        self.df.at[index, data_col] = data_val
                     self._update_xl(index, data_col, data_val) 
                     
                     if status_callback: status_callback(f"✅ Row {index+1}: Processed")
@@ -585,7 +612,8 @@ class BatchProcessor:
             except Exception as e:
                 logger.error(f"Row {index}: Processing error: {e}")
                 val = f"Processing Error: {str(e)}"
-                self.df.at[index, ai_remarks_col] = val
+                with self.write_lock:
+                    self.df.at[index, ai_remarks_col] = val
                 self._update_xl(index, ai_remarks_col, val)
                 if status_callback: status_callback(f"❌ Row {index+1}: Exception")
             finally:
@@ -593,6 +621,7 @@ class BatchProcessor:
                     os.remove(temp_img_path)
         else:
             val = "Download Failed"
-            self.df.at[index, ai_remarks_col] = val
+            with self.write_lock:
+                self.df.at[index, ai_remarks_col] = val
             self._update_xl(index, ai_remarks_col, val)
             if status_callback: status_callback(f"⚠️ Row {index+1}: Download Failed (Check Permissions)")

@@ -4,6 +4,9 @@ import time
 import logging
 import tempfile
 import pandas as pd
+import threading
+import queue
+import concurrent.futures
 from typing import Optional, List
 from dotenv import load_dotenv
 from src.engine import SolarVisionEngine, BatchProcessor
@@ -28,6 +31,14 @@ DEFAULT_MODELS = [
     "llama-3.2-11b-vision-preview"
 ]
 
+# --- Session State Management ---
+if 'is_processing' not in st.session_state:
+    st.session_state.is_processing = False
+if 'processed_file' not in st.session_state:
+    st.session_state.processed_file = None
+if 'log_buffer' not in st.session_state:
+    st.session_state.log_buffer = []
+
 def load_css():
     """Apply custom CSS styles to the Streamlit app."""
     st.markdown(HEADER_STYLE, unsafe_allow_html=True)
@@ -42,7 +53,8 @@ def render_sidebar() -> tuple[Optional[str], str]:
             "Groq API Key", 
             type="password", 
             value=os.getenv("GROQ_API_KEY", ""), 
-            help="Get yours securely at console.groq.com"
+            help="Get yours securely at console.groq.com",
+            disabled=st.session_state.is_processing
         )
         
         st.markdown("---")
@@ -51,103 +63,126 @@ def render_sidebar() -> tuple[Optional[str], str]:
         st.markdown("### 🧠 Logic Engine")
         env_models = os.getenv("GROQ_MODELS")
         model_options = env_models.split(",") if env_models else DEFAULT_MODELS
-        selected_model = st.selectbox("Vision Model", model_options, index=0)
+        selected_model = st.selectbox(
+            "Vision Model", 
+            model_options, 
+            index=0,
+            disabled=st.session_state.is_processing
+        )
         
         st.info(f"**Active Model:** `{selected_model}`\n\n**Latency Target:** < 1.5s")
         
         st.markdown("---")
         st.markdown("### 📊 System Status")
         st.success("●  **Batch Engine Online**")
-        st.caption("v2.6.0-Enterprise • Llama 4 Ready")
+        st.caption("v2.7.0-Enterprise • Llama 4 Ready")
         
         return api_key, selected_model
 
-def process_batch(uploaded_file, api_key: str, model_id: str, col_map: dict):
+def start_batch_processing():
+    """Callback to trigger processing state."""
+    st.session_state.is_processing = True
+    st.session_state.processed_file = None
+    st.session_state.log_buffer = []
+
+def process_batch_logic(uploaded_file, api_key: str, model_id: str, col_map: dict):
     """
-    Handles the end-to-end batch processing logic.
-    - Saves temp file
-    - Initializes Engine
-    - Runs Processing Loop
-    - Handles Cleanup
+    Handles the end-to-end batch processing logic with Queue-based UI updates.
     """
-    # Create valid temp files using tempfile module for robustness
+    # Create valid temp files
     with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_input:
         tmp_input.write(uploaded_file.getbuffer())
         temp_input_path = tmp_input.name
 
-    output_filename = f"processed_{uploaded_file.name}"
-    # We will save output to a path, but ultimately return bytes for download
-    
-    st.toast("Starting Batch Job...", icon="🚀")
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    logs_container = st.expander("📜 Real-time Execution Logs", expanded=True)
-    
     try:
+        # UI Elements
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        logs_placeholder = st.empty()
+        
+        # Log Queue for Thread Safety
+        log_queue = queue.Queue()
+        
         # Initialize Processor
         processor = BatchProcessor(temp_input_path, api_key, model_id=model_id)
         
         # Dev Limiter
-        try:
-            limit_rows = int(os.getenv("MAX_ROWS_LIMIT", 0))
-            if limit_rows > 0:
-                processor.df = processor.df.head(limit_rows)
-                st.warning(f"⚠️ **DEV MODE:** Processing limited to first {limit_rows} rows.")
-        except ValueError:
-            pass
-            
-        total_rows = len(processor.df)
+        env_limit = os.getenv("MAX_ROWS_LIMIT")
+        if env_limit and env_limit.strip():
+            try:
+                limit_rows = int(env_limit)
+                if limit_rows > 0:
+                    processor.df = processor.df.head(limit_rows)
+                    st.warning(f"⚠️ **DEV MODE:** Processing limited to first {limit_rows} rows. Remove MAX_ROWS_LIMIT from .env to process all.")
+            except ValueError:
+                pass # Invalid number in env var, defaulting to all rows
         
+        total_rows = len(processor.df)
         start_time = time.time()
         
-        # Define status callback for UI updates
-        def ui_callback(msg):
-            with logs_container:
-                st.code(msg, language="bash")
+        # Define worker function
+        def process_wrapper(idx, r):
+            try:
+                # Custom callback that puts messages into our thread-safe queue
+                def thread_safe_callback(msg):
+                    log_queue.put(msg)
+                
+                if col_map.get('type') == 'solar_audit':
+                    processor.process_solar_audit_row(idx, r, status_callback=thread_safe_callback)
+                else:
+                    processor.process_row(
+                        idx, r, 
+                        col_map['img'], 
+                        col_map['human'], 
+                        col_map['remarks'], 
+                        col_map['data'],
+                        status_callback=thread_safe_callback
+                    )
+                return True
+            except Exception as e:
+                log_queue.put(f"❌ Row {idx+1} Failed: {str(e)}")
+                return False
 
-        # Execution Loop
-        for index, row in processor.df.iterrows():
-            status_text.markdown(f"**Processing Row {index + 1}/{total_rows}**")
+        # --- PARALLEL EXECUTION LOOP ---
+        # Increased to 20 workers for maximum I/O throughput
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            futures = [executor.submit(process_wrapper, idx, row) for idx, row in processor.df.iterrows()]
             
-            if col_map.get('type') == 'solar_audit':
-                 processor.process_solar_audit_row(
-                     index,
-                     row,
-                     status_callback=ui_callback
-                 )
-            else:
-                # Standard Mode
-                processor.process_row(
-                    index, 
-                    row, 
-                    col_map['img'], 
-                    col_map['human'], 
-                    col_map['remarks'], 
-                    col_map['data'],
-                    status_callback=ui_callback
-                )
-            
-            # Update Progress
-            progress = (index + 1) / total_rows
-            progress_bar.progress(progress)
-        
+            completed = 0
+            while completed < total_rows:
+                # 1. Update Logs from Queue
+                while not log_queue.empty():
+                    msg = log_queue.get()
+                    st.session_state.log_buffer.append(msg)
+                    # Keep buffer reasonable size to prevent UI lag
+                    if len(st.session_state.log_buffer) > 10:
+                        st.session_state.log_buffer.pop(0)
+                
+                # Render Logs (In-Place Update)
+                logs_placeholder.code("\n".join(st.session_state.log_buffer), language="bash")
+
+                # 2. Check Futures
+                # We count how many satisfy "done()" without blocking
+                new_completed = sum(1 for f in futures if f.done())
+                if new_completed > completed:
+                    completed = new_completed
+                    progress = completed / total_rows
+                    progress_bar.progress(progress)
+                    status_text.markdown(f"**⚡ Processing... {completed}/{total_rows} Rows Completed**")
+                
+                time.sleep(0.1) # Prevent tight loop
+
+            # Wait for any lingering threads
+            concurrent.futures.wait(futures)
+
         end_time = time.time()
         duration = end_time - start_time
         
-        # Save results to a bytes buffer for download without temp file issues
-        # Or save to a temp output file if pandas requires path
+        # Save results
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_output:
-            # Save using the processor's save method to preserve styles via OpenPyXL
-            tmp_output.close() # Close file handle so openpyxl can write to it
+            tmp_output.close()
             processor.save(tmp_output.name)
-            tmp_output_path = tmp_output.name
-
-            
-        st.success(f"✅ **Processing Complete!** {total_rows} rows processed in {duration:.2f}s.")
-        st.balloons()
-        
-        return tmp_output_path
+            return tmp_output.name
 
     except Exception as e:
         logger.error(f"Batch Processing Error: {e}", exc_info=True)
@@ -159,8 +194,8 @@ def process_batch(uploaded_file, api_key: str, model_id: str, col_map: dict):
         if os.path.exists(temp_input_path):
             try:
                 os.remove(temp_input_path)
-            except Exception as e:
-                logger.warning(f"Failed to cleanup temp input: {e}")
+            except:
+                pass
 
 def main():
     load_css()
@@ -169,7 +204,7 @@ def main():
     api_key, selected_model = render_sidebar()
 
     if not api_key:
-        st.warning("⚠️ **System Offline:** Please provide a valid Groq API Key to initialize the forensics engine.")
+        st.warning("⚠️ **System Offline:** Please provide a valid Groq API Key.")
         st.stop()
 
     # 2. Hero Section
@@ -184,104 +219,98 @@ def main():
         uploaded_file = st.file_uploader(
             "Upload Excel Sheet (.xlsx) with Google Drive Links", 
             type=["xlsx"],
-            help="Ensure your sheet has a column with 'Anyone with the link' public Google Drive URLs."
+            help="Ensure your sheet has a column with 'Anyone with the link' public Google Drive URLs.",
+            disabled=st.session_state.is_processing
         )
 
-    
     if uploaded_file:
         try:
-            df_preview = pd.read_excel(uploaded_file)
-            columns = list(df_preview.columns)
-            
-            with col_mapping:
-                # --- INTELLIGENT AUTO-CONFIGURATION ---
-                st.markdown("### 🤖 **Auto-Analysis Config**")
+            if not st.session_state.processed_file:
+                # Only show preview if not currently processing or finished
+                df_preview = pd.read_excel(uploaded_file)
+                columns = list(df_preview.columns)
                 
-                # 1. Detect Mode Based on Headers
-                has_solar_headers = any("Module Serial Number Photo" in c for c in columns)
-                
-                if has_solar_headers:
-                    mode = "solar_audit"
-                    st.success("✅ **Detected: Solar Serial Number Audit**")
+                with col_mapping:
+                    # --- AUTO-CONFIG ---
+                    st.markdown("### 🤖 **Auto-Analysis Config**")
+                    has_solar_headers = any("Module Serial Number Photo" in c for c in columns)
                     
-                    # Scan for counts
-                    module_count = sum(1 for c in columns if "Module Serial Number Photo" in c)
-                    inverter_count = sum(1 for c in columns if "Inverter Serial Number Photo" in c or "Inverter Serial Number Image" in c)
-                    
-                    st.info(f"• Found {module_count} Module Photo Series\n• Found {inverter_count} Inverter Photo Series")
-                    
-                    col_map = {'type': 'solar_audit'}
-                    
-                else:
-                    mode = "standard"
-                    st.info("ℹ️ **Detected: Standard Batch Analysis**")
-                    
-                    # 2. HEURISTIC IMAGE COLUMN DETECTION
-                    detected_img_col = None
-                    sample = df_preview.head(5)
-                    
-                    for col in columns:
-                        try:
-                            sample_vals = sample[col].astype(str).tolist()
-                            for val in sample_vals:
-                                if "drive.google.com" in val or "http" in val:
-                                    detected_img_col = col
-                                    break
-                            if detected_img_col: break
-                        except:
-                            continue
-                    
-                    if not detected_img_col:
-                        keywords = ["image", "link", "url", "drive", "photo", "picture"]
-                        for col in columns:
-                            if any(k in col.lower() for k in keywords):
-                                detected_img_col = col
-                                break
-                    
-                    if not detected_img_col:
-                        detected_img_col = columns[0]
-                        st.warning(f"⚠️ Could not auto-detect image column. Defaulting to '{detected_img_col}'. Ensure links are present.")
+                    if has_solar_headers:
+                        mode = "solar_audit"
+                        st.success("✅ **Detected: Solar Serial Number Audit**")
+                        col_map = {'type': 'solar_audit'}
                     else:
-                        st.success(f"🔗 **Targeting Image Column:** `{detected_img_col}`")
-
-                    col_map = {
-                        'type': 'standard',
-                        'img': detected_img_col,
-                        'human': 'Human Detected',
-                        'remarks': 'AI Remarks',
-                        'data': 'Extracted Data'
-                    }
-
-            st.markdown("---")
-            
-            # Preview Data
-            with st.expander("👀 Data Preview (First 5 Rows)", expanded=False):
-                st.dataframe(df_preview.head())
-
-            # Action Button
-            if st.button("🚀 Start Processing", type="primary", use_container_width=True):
-                 output_path = process_batch(uploaded_file, api_key, selected_model, col_map)
-                 
-                 if output_path:
-                    with open(output_path, "rb") as f:
-                        file_data = f.read()
+                        mode = "standard"
+                        st.info("ℹ️ **Detected: Standard Batch Analysis**")
+                        # Heuristic detection logic (simplified for brevity)
+                        detected_img_col = next((c for c in columns if any(k in c.lower() for k in ["image", "link", "url", "drive"])), columns[0])
+                        detected_remarks_col = next((c for c in columns if "ai remarks" in c.lower()), "AI Remarks")
                         
-                    st.download_button(
-                        label="⬇️ Download Processed Report",
-                        data=file_data,
-                        file_name=f"processed_{uploaded_file.name}",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True
-                    )
-                    
-                    # Cleanup Output
-                    try:
-                        os.remove(output_path)
-                    except:
-                        pass
-                    
+                        col_map = {
+                            'type': 'standard',
+                            'img': detected_img_col,
+                            'human': 'Human Detected',
+                            'remarks': detected_remarks_col,
+                            'data': 'Extracted Data'
+                        }
+
+                st.markdown("---")
+                with st.expander("👀 Data Preview (First 5 Rows)", expanded=False):
+                    st.dataframe(df_preview.head())
+
+                # START BUTTON
+                # We use a button to trigger session state change
+                if st.button("🚀 Start Processing", type="primary", use_container_width=True, disabled=st.session_state.is_processing, on_click=start_batch_processing):
+                    # Force a rerun to apply disabled state immediately
+                    pass
+
         except Exception as e:
             st.error(f"Error reading Excel file: {e}")
+
+    # --- PROCESSING BLOCK ---
+    if st.session_state.is_processing and uploaded_file:
+        with st.status("🚀 **AI Batch Processing Active**", expanded=True) as status:
+            st.write("Initializing Worker Swarm...")
+            
+            # Re-infer col_map since it's local scope above (or persist it in session_state, but re-computing is fast)
+            # For simplicity, repeating detection or assuming it's consistent
+            df_temp = pd.read_excel(uploaded_file)
+            cols = list(df_temp.columns)
+            if any("Module Serial Number Photo" in c for c in cols):
+                 col_map = {'type': 'solar_audit'}
+            else:
+                 col_map = {'type': 'standard', 'img': cols[0], 'human': 'Human Detected', 'remarks': 'AI Remarks', 'data': 'Data'} 
+
+            output_path = process_batch_logic(uploaded_file, api_key, selected_model, col_map)
+            
+            if output_path:
+                st.session_state.processed_file = output_path
+                status.update(label="✅ Processing Complete!", state="complete", expanded=False)
+            
+            st.session_state.is_processing = False
+            st.rerun()
+
+    # --- DOWNLOAD BLOCK ---
+    if st.session_state.processed_file:
+        st.success("🎉 **Analysis Complete!** Your report is ready.")
+        
+        with open(st.session_state.processed_file, "rb") as f:
+            file_data = f.read()
+            
+        col_dl_1, col_dl_2 = st.columns([1, 1])
+        with col_dl_1:
+             st.download_button(
+                label="⬇️ Download Document",
+                data=file_data,
+                file_name=f"processed_report_{int(time.time())}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+        with col_dl_2:
+            if st.button("🔄 Process New File", use_container_width=True):
+                st.session_state.processed_file = None
+                st.session_state.log_buffer = []
+                st.rerun()
 
     # Footer
     st.markdown(FOOTER_STYLE, unsafe_allow_html=True)
