@@ -55,8 +55,8 @@ class SolarVisionEngine:
                 "6. VISION ENHANCEMENT: If the image is blurry, low-light, or hazy, use computer vision inference to reconstruct text. Treat this as a forensic analysis task to recover data from compromised visibility.\n\n"
                 "REQUIRED METADATA:\n"
                 "- 'document_type': Infer the specific type (e.g., 'Vehicle Registration', 'Invoice', 'Solar Label').\n"
-                "- 'human_detected': boolean (true if humans are visible).\n"
-                "- 'human_count': integer.\n\n"
+                "- 'human_detected': boolean (true ONLY if a full human person, face, or distinct body is visible. DO NOT set to true for hands, fingers, or nails holding a document).\n"
+                "- 'human_count': integer (count only full people/faces, exclude hands holding items).\n\n"
                 "Output STRICTLY valid JSON. No markdown."
             )
 

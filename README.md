@@ -2,7 +2,9 @@
 
 **Clarogent** is an AI forensics platform built to automate field audits, document verification, and asset intelligence.
 
-Powered by **Groq Cloud** and **Llama 4 Maverick Vision**, it delivers millisecond-latency OCR and scene understanding, capable of instantly digitizing everything from solar panel labels to complex government IDs (Aadhaar, PAN, Vehicle RC).
+Architected to meet the high-precision standards of the **Solar Industry**, Clarogent goes beyond generic OCR to handle the specific constraints of field operations. Whether capturing technical specifications from solar panel labels under harsh glare or verifying installer safety compliance, the system is tuned for industrial-grade accuracy while maintaining universal applicability for field documents.
+
+Powered by **Groq Cloud** and **Llama 4 Maverick Vision**, it delivers millisecond-latency OCR and scene understanding, instantly digitizing unique assets alongside standard government IDs (Aadhaar, PAN, Vehicle RC).
 
 [![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://clarogent-ai.streamlit.app/)
 
@@ -19,12 +21,12 @@ Powered by **Groq Cloud** and **Llama 4 Maverick Vision**, it delivers milliseco
 
 - **No Templates Required**: The AI dynamically discovers fields.
 - **Smart Classification**: Auto-detects if an image is a Solar Panel, Vehicle RC, Aadhaar, or Invoice.
-- **Deep Extraction**: Captures nested details like `vehicle_details`, `owner_address`, and `technical_specs`.
+- **Deep Extraction**: Captures nested details like `technical_specs` (Pmax, Voc, Isc for solar modules) and `vehicle_details`.
 
 ### 3. 👥 Field Intelligence
 
 - **Human Detection**: Instantly counts personnel in a scene for compliance (e.g., "2 Installers Detected").
-- **Safety Compliance**: verifying if PPE (hard hats) is visible (implicit via prompt).
+- **Safety Compliance**: Real-time verification of installer PPE (hard hats, vests) for on-site safety audits.
 
 ---
 
