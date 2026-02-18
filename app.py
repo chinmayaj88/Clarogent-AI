@@ -119,9 +119,10 @@ def main():
                 if res.get('domain_relevant') is False:
                     st.error(f"⛔ **Domain Check Failed:** {res.get('rejection_reason', 'Image is not relevant to Solar, Documents, or Field operations.')}")
                     st.warning("Please upload a valid asset (Solar Panel, Invoice, ID Card, Vehicle, Field Site).")
-                else:
-                    # Top Metrics Row
-                    st.markdown("### 📊 **Intelligence Report**")
+                    st.stop()
+
+                # Top Metrics Row
+                st.markdown("### 📊 **Intelligence Report**")
                 
                 m1, m2, m3 = st.columns(3)
                 human_count = res.get('human_count', 0)
@@ -156,22 +157,23 @@ def main():
                     st.caption("Hierarchical view of complex document structures (Tables, Nested Groups).")
                     
                     # Recursive Renderer
-                    def render_recursive(data, level=0):
+                    def render_recursive(data, parent_key="root", level=0):
                         if isinstance(data, dict):
                             for k, v in data.items():
                                 if k in excluded_meta: continue
                                 label = k.replace('_', ' ').title()
+                                current_key = f"{parent_key}_{k}"
                                 
                                 if isinstance(v, (dict, list)):
                                     with st.expander(f"📂 {label}", expanded=(level==0)):
-                                        render_recursive(v, level+1)
+                                        render_recursive(v, current_key, level+1)
                                 else:
-                                    st.text_input(label, str(v), key=f"deep_{k}_{level}")
+                                    st.text_input(label, str(v), key=f"deep_{current_key}")
                                     
                         elif isinstance(data, list):
                             for i, item in enumerate(data):
                                 st.markdown(f"**Item {i+1}**")
-                                render_recursive(item, level+1)
+                                render_recursive(item, f"{parent_key}_{i}", level+1)
                                 st.divider()
 
                     render_recursive(res)
