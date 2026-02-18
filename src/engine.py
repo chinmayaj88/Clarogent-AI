@@ -244,6 +244,46 @@ class SolarVisionEngine:
 
 
 
+    @retry(
+        retry=retry_if_exception_type(RateLimitError),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10)
+    )
+    def detect_human(self, image_path: str) -> bool:
+        """
+        Detects if a human (person/face) is present in the image.
+        Returns True/False.
+        """
+        try:
+            base64_image = self._encode_image(image_path)
+            system_prompt = (
+                "Do you see a HUMAN PERSON in this image? "
+                "Look for full bodies, faces, or distinct body parts (arms/legs). "
+                "Ignore hands/fingers holding the camera or document. "
+                "Reply ONLY with 'YES' or 'NO'."
+            )
+            
+            completion = self.client.chat.completions.create(
+                model=self.model_id,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": system_prompt},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                        ]
+                    }
+                ],
+                temperature=0.0,
+                max_tokens=10,
+                stream=False
+            )
+            ans = completion.choices[0].message.content.strip().upper()
+            return "YES" in ans
+        except Exception as e:
+            logger.error(f"Human Detection Failed: {e}")
+            return False
+
 class BatchProcessor:
     """
     Handles bulk processing of Excel sheets containing Google Drive links.
@@ -362,16 +402,14 @@ class BatchProcessor:
     def process_solar_audit_row(self, index, row, status_callback=None):
         """
         Specialized processor for Solar Audit Sheets.
-        Automatically detects 'Module Serial Number Photo X' and fills 'AI Module Serial Number X'.
+        1. Extract Module Serial Numbers.
+        2. Extract Inverter Serial Numbers.
+        3. Detect Humans in Installation Photos.
         """
-        # Define the logic for pairs
-        # We look for "Module Serial Number Photo X" and writes to "AI Module Serial Number X"
-        # We look for "Inverter Serial Number Photo" (or similar) and writes to "AI Inverter Serial Number"
-        
         cols = row.index.tolist()
-        processed_any = False
+        count = 0
         
-        # 1. Helper to process a single pair
+        # --- Helper 1: Process Serial Number Pairs ---
         def process_pair(photo_col, target_col, asset_type):
             img_url = row.get(photo_col)
             if not img_url or pd.isna(img_url) or not isinstance(img_url, str):
@@ -384,7 +422,7 @@ class BatchProcessor:
                 self._update_xl(index, target_col, val)
                 return False
                 
-            temp_path = f"temp_{asset_type}_{index}.jpg"
+            temp_path = f"temp_{asset_type.replace(' ','_')}_{index}.jpg"  
             if self._download_image(drive_id, temp_path):
                 serial = self.engine.extract_serial_only(temp_path, asset_type)
                 self.df.at[index, target_col] = serial
@@ -397,40 +435,89 @@ class BatchProcessor:
                  self._update_xl(index, target_col, val)
                  return False
 
-        # 2. Iterate through columns to find Photo columns
-        count = 0
-        for col in cols:
-            # Check for Module Photos
-            if "Module Serial Number Photo" in col:
-                # Deduce target: Replace "Photo" with nothing, prefix with "AI" 
-                # e.g., "Module Serial Number Photo 1" -> "AI Module Serial Number 1"
-                # But user said "AI Module Serial Number 1" is the target.
+        # --- Helper 2: Check Human Presence ---
+        human_detected_overall = False
+        human_audit_remarks = []
+
+        def check_human_in_col(col_name, label):
+            nonlocal human_detected_overall
+            img_url = row.get(col_name)
+            if not img_url or pd.isna(img_url):
+                human_audit_remarks.append(f"{label}: Not Present")
+                return
+
+            drive_id = self._get_drive_id(img_url)
+            if not drive_id:
+                human_audit_remarks.append(f"{label}: Invalid Link")
+                return
+
+            temp_path = f"temp_human_{index}_{label}.jpg"
+            if self._download_image(drive_id, temp_path):
+                has_human = self.engine.detect_human(temp_path)
+                if has_human:
+                    human_detected_overall = True
+                    human_audit_remarks.append(f"{label}: Human Found")
+                else:
+                    human_audit_remarks.append(f"{label}: Clear")
                 
-                # Logic: Target = "AI " + col.replace(" Photo", "") 
-                # Let's try to find the matching AI column dynamically
+                if os.path.exists(temp_path): os.remove(temp_path)
+            else:
+                human_audit_remarks.append(f"{label}: Download Failed")
+
+        # --- Execution Limit Check ---
+        # (Assuming limits handled elsewhere or user pays)
+
+        # 1. Iterate columns for Serial Numbers
+        for col in cols:
+            # A. Module Serial Numbers
+            if "Module Serial Number Photo" in col:
                 suffix = col.replace("Module Serial Number Photo", "").strip()
                 target_candidates = [c for c in cols if f"AI Module Serial Number {suffix}" in c]
+                if target_candidates:
+                    if process_pair(col, target_candidates[0], "Solar Module"):
+                        count += 1
+            
+            # B. Inverter Serial Numbers
+            elif "Inverter Serial Number Photo" in col:
+                # Find Target: AI Inverter Serial Number
+                # Handle potential suffix if multiple inverters exist
+                suffix = col.replace("Inverter Serial Number Photo", "").strip()
+                # Target is usually "AI Inverter Serial Number" (singular) or with suffix
+                target_candidates = [c for c in cols if f"AI Inverter Serial Number{suffix}" in c]
+                if not target_candidates:
+                     # Fallback to generic if no suffix match
+                     target_candidates = [c for c in cols if "AI Inverter Serial Number" in c]
                 
                 if target_candidates:
-                    target_col = target_candidates[0]
-                    if process_pair(col, target_col, "Solar Module"):
+                    if process_pair(col, target_candidates[0], "Inverter"):
                         count += 1
-                        
-            # Check for Inverter Photos (DISABLED FOR NOW)
-            # elif "Inverter" in col and ("Photo" in col or "Image" in col):
-            #      # Find target "AI Inverter..."
-            #      target_candidates = [c for c in cols if "AI Inverter Serial Number" in c]
-            #      if target_candidates:
-            #          target_col = target_candidates[0]
-            #          if process_pair(col, target_col, "Inverter"):
-            #              count += 1
-            pass
+
+        # 2. Check Installation Photos for Humans
+        panel_view_cols = [c for c in cols if "Installation Photo" in c and "Panel View" in c]
+        inverter_view_cols = [c for c in cols if "Installation Photo" in c and "Inverter View" in c]
+
+        if panel_view_cols: check_human_in_col(panel_view_cols[0], "Panel View")
+        if inverter_view_cols: check_human_in_col(inverter_view_cols[0], "Inverter View")
+
+        # 3. Update Human Detection Columns
+        human_col_candidates = [c for c in cols if "Human Detected" in c]
+        if human_col_candidates:
+            val = "YES" if human_detected_overall else "NO"
+            self.df.at[index, human_col_candidates[0]] = val
+            self._update_xl(index, human_col_candidates[0], val)
+
+        # 4. Update Remarks
+        remarks_col_candidates = [c for c in cols if "AI Remarks" in c]
+        if remarks_col_candidates and human_audit_remarks:
+            val = " | ".join(human_audit_remarks)
+            self.df.at[index, remarks_col_candidates[0]] = val
+            self._update_xl(index, remarks_col_candidates[0], val)
 
         if status_callback:
             if count > 0:
-                status_callback(f"✅ Row {index+1}: Extracted {count} Serial Numbers")
+                status_callback(f"✅ Row {index+1}: Extracted {count} Serials | Humans: {human_detected_overall}")
             else:
-                status_callback(f"⚠️ Row {index+1}: No valid photos found")
+                status_callback(f"⚠️ Row {index+1}: Processed (No Serials Found)")
 
     def process_row(self, index, row, img_col, human_col, ai_remarks_col, data_col, status_callback=None):
         """Processes a single row."""
