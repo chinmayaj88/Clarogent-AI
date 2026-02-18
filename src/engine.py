@@ -1,9 +1,16 @@
+
 import logging
 import json
 import base64
+import os
+import requests
+import pandas as pd
+from urllib.parse import urlparse, parse_qs
 from typing import Dict, Any, Optional
 from groq import Groq, RateLimitError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
 # Configure Enterprise Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -18,11 +25,15 @@ class SolarVisionEngine:
     - Robust JSON Structure Enforcement
     """
     
-    def __init__(self, api_key: str, model_id: str = "llama-3.2-90b-vision-preview"):
-        """Initialize the Groq client securely."""
-        self.client = Groq(api_key=api_key)
-        # Using variable model ID for flexibility
-        self.model_id = model_id
+    def __init__(self, api_key: Optional[str] = None, model_id: str = "llama-3.2-90b-vision-preview"):
+        """Initialize the Groq client securely from Env or Argument."""
+        self.api_key = api_key or os.getenv("GROQ_API_KEY")
+        if not self.api_key:
+            raise ValueError("GROQ_API_KEY is not set. Please provide it or set the environment variable.")
+            
+        self.client = Groq(api_key=self.api_key)
+        # Using variable model ID for flexibility, default fallback from env if provided there
+        self.model_id = os.getenv("GROQ_MODEL_ID", model_id)
 
     def _encode_image(self, image_path: str) -> str:
         """Optimized Base64 encoding for image payloads."""
@@ -44,6 +55,7 @@ class SolarVisionEngine:
             base64_image = self._encode_image(image_path)
             
             # Universal Document Discovery Prompt (No Hardcoding)
+            # CRITICAL: Includes Human Detection, Quality Check, and Domain Validation
             system_prompt = (
                 "ACT AS A UNIVERSAL DOCUMENT/IMAGE PARSER. Your task is to digitize this image into a structured JSON format.\n"
                 "RULES:\n"
@@ -112,3 +124,323 @@ class SolarVisionEngine:
         except Exception as e:
             logger.error(f"Critical Vision Engine Failure: {str(e)}", exc_info=True)
             return {"error": str(e)}
+
+    @retry(
+        retry=retry_if_exception_type(RateLimitError),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10)
+    )
+    def extract_serial_only(self, image_path: str, asset_type: str = "Solar Module") -> str:
+        """
+        Specialized extraction for Serial Numbers.
+        Focuses ONLY on alphanumeric sequences, ignoring technical specs.
+        """
+        try:
+            base64_image = self._encode_image(image_path)
+            
+            # Focused Serial Number Prompt
+            system_prompt = (
+                f"Your Task: Extract the SERIAL NUMBER from this {asset_type} photo.\n"
+                "Target: A unique alphanumeric string identifying this specific unit.\n"
+                "Rules:\n"
+                "- IGNORE: Model numbers (e.g., 'JKM545M'), electrical ratings (e.g., '545W', '1500V').\n"
+                "- IGNORE: Date codes or manufacturer addresses.\n"
+                "- FORMAT: Return ONLY the raw serial number string. No JSON. No markdown. No labels like 'Serial:'.\n"
+                "- If unreadable/missing, return 'N/A'."
+            )
+
+            completion = self.client.chat.completions.create(
+                model=self.model_id,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": system_prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{base64_image}"
+                                }
+                            }
+                        ]
+                    }
+                ],
+                temperature=0.0, # Deterministic
+                max_tokens=50,
+                top_p=1,
+                stream=False
+            )
+            
+            return completion.choices[0].message.content.strip()
+
+        except Exception as e:
+            logger.error(f"Serial Extraction Failed: {str(e)}")
+            return "Error"
+
+
+
+class BatchProcessor:
+    """
+    Handles bulk processing of Excel sheets containing Google Drive links.
+    Integrates with SolarVisionEngine for row-by-row analysis.
+    """
+    def __init__(self, excel_path: str, api_key: Optional[str] = None, model_id: str = "llama-3.2-90b-vision-preview"):
+        self.excel_path = excel_path
+        # Initialize Engine (it handles env variable fallback)
+        self.engine = SolarVisionEngine(api_key=api_key, model_id=model_id)
+        
+        # Load Excel with Pandas for processing logic
+        try:
+            self.df = pd.read_excel(excel_path)
+            
+            # Load Excel with OpenPyXL for style preservation
+            self.wb = load_workbook(excel_path)
+            self.ws = self.wb.active
+            
+            # Map column names to 1-based indices for OpenPyXL
+            # Assumption: Headers are in the first row
+            self.col_map_xl = {}
+            for idx, col_cell in enumerate(self.ws[1], start=1):
+                if col_cell.value:
+                    self.col_map_xl[col_cell.value] = idx
+                    
+            logger.info(f"Loaded Excel file: {excel_path} with {len(self.df)} rows.")
+        except Exception as e:
+            logger.error(f"Failed to load Excel file: {e}")
+            raise
+
+    def save(self, output_path: str):
+        """Saves the processed workbook, preserving styles but auto-fitting columns."""
+        try:
+            # Auto-resize columns
+            for i, col in enumerate(self.ws.columns, start=1):
+                col_letter = get_column_letter(i)
+                max_length = 0
+                
+                for cell in col:
+                    try:
+                        if cell.value:
+                            val_len = len(str(cell.value))
+                            if val_len > max_length:
+                                max_length = val_len
+                    except:
+                        pass
+                
+                # Add padding and cap width
+                adjusted_width = (max_length + 2)
+                # Cap at 60 chars for readability
+                if adjusted_width > 60: 
+                    adjusted_width = 60
+                
+                self.ws.column_dimensions[col_letter].width = adjusted_width
+
+            self.wb.save(output_path)
+            logger.info(f"Saved processed file to {output_path}")
+        except Exception as e:
+            logger.error(f"Failed to save output file: {e}")
+            raise
+
+    def _update_xl(self, row_idx, col_name, value):
+        """Updates the OpenPyXL worksheet cell, preserving style."""
+        try:
+            # Pandas index is 0-based. Excel rows are 1-based.
+            # Usually row 1 is header. So data starts at row 2.
+            # Row in Excel = row_idx + 2
+            xl_row = row_idx + 2
+            
+            if col_name in self.col_map_xl:
+                xl_col = self.col_map_xl[col_name]
+                self.ws.cell(row=xl_row, column=xl_col).value = value
+        except Exception as e:
+            logger.warning(f"Failed to update Excel cell: {e}")
+
+    def _get_drive_id(self, url: str) -> Optional[str]:
+        """Extracts Google Drive file ID from URL."""
+        if not isinstance(url, str):
+            return None
+            
+        parsed = urlparse(url)
+        if 'drive.google.com' in parsed.netloc:
+            # Handle /file/d/ID/view format
+            path_parts = parsed.path.split('/')
+            if 'd' in path_parts:
+                try:
+                    return path_parts[path_parts.index('d') + 1]
+                except IndexError:
+                    pass
+            
+            # Handle ?id=ID format
+            query = parse_qs(parsed.query)
+            if 'id' in query:
+                return query['id'][0]
+                
+        return None
+
+    def _download_image(self, drive_id: str, save_path: str) -> bool:
+        """Downloads image from Google Drive using ID."""
+        url = f"https://drive.google.com/uc?export=download&id={drive_id}"
+        try:
+            response = requests.get(url, stream=True)
+            if response.status_code == 200:
+                with open(save_path, 'wb') as f:
+                    for chunk in response.iter_content(1024):
+                        f.write(chunk)
+                return True
+            else:
+                logger.warning(f"Failed to download image: {drive_id} (Status: {response.status_code})")
+                return False
+        except Exception as e:
+            logger.error(f"Error downloading image {drive_id}: {e}")
+            return False
+
+
+    def process_solar_audit_row(self, index, row, status_callback=None):
+        """
+        Specialized processor for Solar Audit Sheets.
+        Automatically detects 'Module Serial Number Photo X' and fills 'AI Module Serial Number X'.
+        """
+        # Define the logic for pairs
+        # We look for "Module Serial Number Photo X" and writes to "AI Module Serial Number X"
+        # We look for "Inverter Serial Number Photo" (or similar) and writes to "AI Inverter Serial Number"
+        
+        cols = row.index.tolist()
+        processed_any = False
+        
+        # 1. Helper to process a single pair
+        def process_pair(photo_col, target_col, asset_type):
+            img_url = row.get(photo_col)
+            if not img_url or pd.isna(img_url) or not isinstance(img_url, str):
+                return False
+                
+            drive_id = self._get_drive_id(img_url)
+            if not drive_id:
+                val = "Invalid Link"
+                self.df.at[index, target_col] = val
+                self._update_xl(index, target_col, val)
+                return False
+                
+            temp_path = f"temp_{asset_type}_{index}.jpg"
+            if self._download_image(drive_id, temp_path):
+                serial = self.engine.extract_serial_only(temp_path, asset_type)
+                self.df.at[index, target_col] = serial
+                self._update_xl(index, target_col, serial)
+                if os.path.exists(temp_path): os.remove(temp_path)
+                return True
+            else:
+                 val = "Download Failed"
+                 self.df.at[index, target_col] = val
+                 self._update_xl(index, target_col, val)
+                 return False
+
+        # 2. Iterate through columns to find Photo columns
+        count = 0
+        for col in cols:
+            # Check for Module Photos
+            if "Module Serial Number Photo" in col:
+                # Deduce target: Replace "Photo" with nothing, prefix with "AI" 
+                # e.g., "Module Serial Number Photo 1" -> "AI Module Serial Number 1"
+                # But user said "AI Module Serial Number 1" is the target.
+                
+                # Logic: Target = "AI " + col.replace(" Photo", "") 
+                # Let's try to find the matching AI column dynamically
+                suffix = col.replace("Module Serial Number Photo", "").strip()
+                target_candidates = [c for c in cols if f"AI Module Serial Number {suffix}" in c]
+                
+                if target_candidates:
+                    target_col = target_candidates[0]
+                    if process_pair(col, target_col, "Solar Module"):
+                        count += 1
+                        
+            # Check for Inverter Photos (DISABLED FOR NOW)
+            # elif "Inverter" in col and ("Photo" in col or "Image" in col):
+            #      # Find target "AI Inverter..."
+            #      target_candidates = [c for c in cols if "AI Inverter Serial Number" in c]
+            #      if target_candidates:
+            #          target_col = target_candidates[0]
+            #          if process_pair(col, target_col, "Inverter"):
+            #              count += 1
+            pass
+
+        if status_callback:
+            if count > 0:
+                status_callback(f"✅ Row {index+1}: Extracted {count} Serial Numbers")
+            else:
+                status_callback(f"⚠️ Row {index+1}: No valid photos found")
+
+    def process_row(self, index, row, img_col, human_col, ai_remarks_col, data_col, status_callback=None):
+        """Processes a single row."""
+        # ... (Old Logic - Unchanged) ...
+        image_url = row.get(img_col)
+        # Re-insert the start of the original method to ensure it's still available for generic mode
+        if not image_url or pd.isna(image_url):
+            logger.info(f"Row {index}: No image URL found. Skipping.")
+            return
+
+        drive_id = self._get_drive_id(image_url)
+        if not drive_id:
+            logger.warning(f"Row {index}: Could not extract Drive ID from URL: {image_url}")
+            return
+            
+        temp_img_path = f"temp_batch_{index}.jpg"
+        
+        if self._download_image(drive_id, temp_img_path):
+            try:
+                # Analyze image
+                result = self.engine.analyze_installation(temp_img_path)
+                
+                # Check for errors
+                if "error" in result:
+                    val = f"Error: {result['error']}"
+                    self.df.at[index, ai_remarks_col] = val
+                    self._update_xl(index, ai_remarks_col, val)
+                    
+                    if status_callback: status_callback(f"⚠️ Row {index+1}: Vision Error")
+                else:
+                    # Fill columns
+                    human_detected_val = "YES" if result.get('human_detected', False) else "NO"
+                    self.df.at[index, human_col] = human_detected_val
+                    self._update_xl(index, human_col, human_detected_val)
+                    
+                    # AI Remarks Logic
+                    remarks = []
+                    if not result.get('domain_relevant', True):
+                        remarks.append(f"Irrelevant: {result.get('rejection_reason', 'Unknown')}")
+                    
+                    remarks.append(f"Type: {result.get('document_type', 'Unknown')}")
+                    remarks.append(f"Confidence: {result.get('confidence', 'N/A')}")
+                    
+                    # Human Count
+                    h_count = result.get('human_count', 0)
+                    if h_count > 0:
+                         remarks.append(f"Humans: {h_count}")
+
+                    remarks_val = " | ".join(remarks)
+                    self.df.at[index, ai_remarks_col] = remarks_val
+                    self._update_xl(index, ai_remarks_col, remarks_val)
+                    
+                    # Extracted Data (JSON Dump or Summary)
+                    # Filter out metadata keys for cleaner data
+                    excluded_keys = ['document_type', 'domain_relevant', 'rejection_reason', 'human_detected', 'human_count', 'confidence', 'error']
+                    data_only = {k: v for k, v in result.items() if k not in excluded_keys}
+                    data_val = str(data_only)
+                    self.df.at[index, data_col] = data_val
+                    self._update_xl(index, data_col, data_val) 
+                    
+                    if status_callback: status_callback(f"✅ Row {index+1}: Processed")
+                
+                logger.info(f"Row {index}: Processed successfully.")
+                
+            except Exception as e:
+                logger.error(f"Row {index}: Processing error: {e}")
+                val = f"Processing Error: {str(e)}"
+                self.df.at[index, ai_remarks_col] = val
+                self._update_xl(index, ai_remarks_col, val)
+                if status_callback: status_callback(f"❌ Row {index+1}: Exception")
+            finally:
+                if os.path.exists(temp_img_path):
+                    os.remove(temp_img_path)
+        else:
+            val = "Download Failed"
+            self.df.at[index, ai_remarks_col] = val
+            self._update_xl(index, ai_remarks_col, val)
+            if status_callback: status_callback(f"⚠️ Row {index+1}: Download Failed (Check Permissions)")

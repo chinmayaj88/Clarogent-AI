@@ -6,3 +6,6 @@ pillow>=10.2.0
 
 # --- Utilities ---
 tenacity>=8.2.0
+pandas>=2.2.0
+openpyxl>=3.1.0
+requests>=2.31.0

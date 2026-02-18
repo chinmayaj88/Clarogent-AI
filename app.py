@@ -2,206 +2,286 @@ import streamlit as st
 import os
 import time
 import logging
-from PIL import Image
+import tempfile
+import pandas as pd
+from typing import Optional, List
 from dotenv import load_dotenv
-from src.engine import SolarVisionEngine
+from src.engine import SolarVisionEngine, BatchProcessor
 from src.ui_styles import HEADER_STYLE, FOOTER_STYLE
 
-# Load Environment
+# --- Configuration & Setup ---
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("SolarAI.App")
 
-# Page Config
 st.set_page_config(
-    page_title="Clarogent AI | Universal Document Forensics",
+    page_title="Clarogent AI | Batch Document Processor",
     page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Apply Custom Styles
-st.markdown(HEADER_STYLE, unsafe_allow_html=True)
+# --- Constants ---
+DEFAULT_MODELS = [
+    "llama-3.2-90b-vision-preview",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "llama-3.2-11b-vision-preview"
+]
 
-def main():
-    # --- Sidebar Configuration ---
+def load_css():
+    """Apply custom CSS styles to the Streamlit app."""
+    st.markdown(HEADER_STYLE, unsafe_allow_html=True)
+
+def render_sidebar() -> tuple[Optional[str], str]:
+    """Renders the sidebar configuration and returns API Key and Model ID."""
     with st.sidebar:
         st.markdown("## ⚙️ Configuration")
         
-        # API Key Management
-        api_key = st.text_input("Groq API Key", type="password", value=os.getenv("GROQ_API_KEY", ""), help="Get yours at console.groq.com")
+        # API Key
+        api_key = st.text_input(
+            "Groq API Key", 
+            type="password", 
+            value=os.getenv("GROQ_API_KEY", ""), 
+            help="Get yours securely at console.groq.com"
+        )
         
         st.markdown("---")
         
         # Model Selection
         st.markdown("### 🧠 Logic Engine")
-        default_models = [
-            "meta-llama/llama-4-maverick-17b-128e-instruct",
-            "llama-3.2-90b-vision-preview",
-            "llama-3.2-11b-vision-preview"
-        ]
-        
-        # Environment Override Check
         env_models = os.getenv("GROQ_MODELS")
-        model_options = env_models.split(",") if env_models else default_models
-            
+        model_options = env_models.split(",") if env_models else DEFAULT_MODELS
         selected_model = st.selectbox("Vision Model", model_options, index=0)
         
-        st.info(f"**active model:** `{selected_model}`\n\n**latency targets:** < 1.5s")
+        st.info(f"**Active Model:** `{selected_model}`\n\n**Latency Target:** < 1.5s")
         
         st.markdown("---")
         st.markdown("### 📊 System Status")
-        st.success("●  **Engine Online**")
-        st.caption("v2.4.0-Enterprise • Llama 4 Ready")
+        st.success("●  **Batch Engine Online**")
+        st.caption("v2.6.0-Enterprise • Llama 4 Ready")
+        
+        return api_key, selected_model
+
+def process_batch(uploaded_file, api_key: str, model_id: str, col_map: dict):
+    """
+    Handles the end-to-end batch processing logic.
+    - Saves temp file
+    - Initializes Engine
+    - Runs Processing Loop
+    - Handles Cleanup
+    """
+    # Create valid temp files using tempfile module for robustness
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_input:
+        tmp_input.write(uploaded_file.getbuffer())
+        temp_input_path = tmp_input.name
+
+    output_filename = f"processed_{uploaded_file.name}"
+    # We will save output to a path, but ultimately return bytes for download
+    
+    st.toast("Starting Batch Job...", icon="🚀")
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    logs_container = st.expander("📜 Real-time Execution Logs", expanded=True)
+    
+    try:
+        # Initialize Processor
+        processor = BatchProcessor(temp_input_path, api_key, model_id=model_id)
+        
+        # Dev Limiter
+        try:
+            limit_rows = int(os.getenv("MAX_ROWS_LIMIT", 0))
+            if limit_rows > 0:
+                processor.df = processor.df.head(limit_rows)
+                st.warning(f"⚠️ **DEV MODE:** Processing limited to first {limit_rows} rows.")
+        except ValueError:
+            pass
+            
+        total_rows = len(processor.df)
+        
+        start_time = time.time()
+        
+        # Define status callback for UI updates
+        def ui_callback(msg):
+            with logs_container:
+                st.code(msg, language="bash")
+
+        # Execution Loop
+        for index, row in processor.df.iterrows():
+            status_text.markdown(f"**Processing Row {index + 1}/{total_rows}**")
+            
+            if col_map.get('type') == 'solar_audit':
+                 processor.process_solar_audit_row(
+                     index,
+                     row,
+                     status_callback=ui_callback
+                 )
+            else:
+                # Standard Mode
+                processor.process_row(
+                    index, 
+                    row, 
+                    col_map['img'], 
+                    col_map['human'], 
+                    col_map['remarks'], 
+                    col_map['data'],
+                    status_callback=ui_callback
+                )
+            
+            # Update Progress
+            progress = (index + 1) / total_rows
+            progress_bar.progress(progress)
+        
+        end_time = time.time()
+        duration = end_time - start_time
+        
+        # Save results to a bytes buffer for download without temp file issues
+        # Or save to a temp output file if pandas requires path
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_output:
+            # Save using the processor's save method to preserve styles via OpenPyXL
+            tmp_output.close() # Close file handle so openpyxl can write to it
+            processor.save(tmp_output.name)
+            tmp_output_path = tmp_output.name
+
+            
+        st.success(f"✅ **Processing Complete!** {total_rows} rows processed in {duration:.2f}s.")
+        st.balloons()
+        
+        return tmp_output_path
+
+    except Exception as e:
+        logger.error(f"Batch Processing Error: {e}", exc_info=True)
+        st.error(f"❌ **Critical Batch Error:** {str(e)}")
+        return None
+        
+    finally:
+        # Cleanup Input File
+        if os.path.exists(temp_input_path):
+            try:
+                os.remove(temp_input_path)
+            except Exception as e:
+                logger.warning(f"Failed to cleanup temp input: {e}")
+
+def main():
+    load_css()
+    
+    # 1. Sidebar & Config
+    api_key, selected_model = render_sidebar()
 
     if not api_key:
         st.warning("⚠️ **System Offline:** Please provide a valid Groq API Key to initialize the forensics engine.")
         st.stop()
 
-    # --- Hero Section ---
+    # 2. Hero Section
     st.markdown('<h1 class="hero-title">Clarogent AI</h1>', unsafe_allow_html=True)
-    st.markdown('<p class="hero-subtitle">Universal Document Forensics & Field Intelligence. Powered by Groq LPU™.</p>', unsafe_allow_html=True)
+    st.markdown('<p class="hero-subtitle">Enterprise Batch Document Intelligence & Field Auditing.</p>', unsafe_allow_html=True)
 
-    # Initialize Engine
-    engine = SolarVisionEngine(api_key, model_id=selected_model)
-
-    # --- Main Interface ---
-    col_upload, col_results = st.columns([1, 1.5], gap="large")
+    # 3. Main Interface
+    col_upload, col_mapping = st.columns([1, 1], gap="large")
 
     with col_upload:
-        st.markdown("### 📤 **Evidence Upload**")
+        st.markdown("### 📤 **Data Ingestion**")
         uploaded_file = st.file_uploader(
-            "Upload any document (PDF, PNG, JPG) or Field Photo", 
-            type=["jpg", "jpeg", "png"],
-            help="Drag and drop your file here. Supports High-Res images."
+            "Upload Excel Sheet (.xlsx) with Google Drive Links", 
+            type=["xlsx"],
+            help="Ensure your sheet has a column with 'Anyone with the link' public Google Drive URLs."
         )
-        
-        if uploaded_file:
-            # Preview Container
-            with st.container():
-                st.image(uploaded_file, caption="📷 Source Evidence", use_container_width=True)
+
+    
+    if uploaded_file:
+        try:
+            df_preview = pd.read_excel(uploaded_file)
+            columns = list(df_preview.columns)
             
-            # Action Button
-            if st.button("🚀 Run Forensic Analysis", type="primary", use_container_width=True):
-                # Save locally for processing
-                try:
-                    temp_path = f"temp_{int(time.time())}_{uploaded_file.name}"
-                    with open(temp_path, "wb") as f:
-                        f.write(uploaded_file.getbuffer())
-                    
-                    # Execution
-                    with st.status("🔍 analyzing visual data...", expanded=True) as status:
-                        st.write("⚡ connecting to groq cloud lpu...")
-                        time.sleep(0.5) # UX Pacing
-                        st.write("🧠 inferring document structure...")
-                        result = engine.analyze_installation(temp_path)
-                        st.write("✅ validating extraction schema...")
-                        status.update(label="**Forensics Complete!**", state="complete", expanded=False)
-                    
-                    st.session_state.result = result
-                    st.session_state.timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-                    
-                    # Cleanup
-                    if os.path.exists(temp_path): os.remove(temp_path)
-
-                except Exception as e:
-                    st.error(f"❌ **System Error:** {str(e)}")
-
-    # --- Results Display ---
-    with col_results:
-        if "result" in st.session_state:
-            res = st.session_state.result
-            
-            if "error" in res:
-                st.error(f"❌ **Analysis Failed:** {res['error']}")
-            else:
-                # Domain Validation Check
-                if res.get('domain_relevant') is False:
-                    st.error(f"⛔ **Domain Check Failed:** {res.get('rejection_reason', 'Image is not relevant to Solar, Documents, or Field operations.')}")
-                    st.warning("Please upload a valid asset (Solar Panel, Invoice, ID Card, Vehicle, Field Site).")
-                    st.stop()
-
-                # Top Metrics Row
-                st.markdown("### 📊 **Intelligence Report**")
+            with col_mapping:
+                # --- INTELLIGENT AUTO-CONFIGURATION ---
+                st.markdown("### 🤖 **Auto-Analysis Config**")
                 
-                m1, m2, m3 = st.columns(3)
-                human_count = res.get('human_count', 0)
-                human_status = "✅ YES ({})".format(human_count) if res.get('human_detected') else "❌ NONE"
+                # 1. Detect Mode Based on Headers
+                has_solar_headers = any("Module Serial Number Photo" in c for c in columns)
                 
-                m1.metric("👥 Human Presence", human_status)
-                m2.metric("📄 Document Type", res.get('document_type', 'Unknown').upper())
-                m3.metric("⚡ Confidence", "98.5%") # Placeholder or extracted confidence
-
-                st.markdown("---")
-
-                # Tabs for deeper analysis
-                tab1, tab2, tab3 = st.tabs(["📝 Extracted Data", "🧩 Deep Structure", "💾 Raw JSON"])
-
-                with tab1:
-                    st.caption("Key extracted fields identified by the Universal Parser.")
+                if has_solar_headers:
+                    mode = "solar_audit"
+                    st.success("✅ **Detected: Solar Serial Number Audit**")
                     
-                    # Smart Filtering of Keys
-                    excluded_meta = ['document_type', 'human_detected', 'human_count', 'solar_panel_detected', 'confidence', 'error']
+                    # Scan for counts
+                    module_count = sum(1 for c in columns if "Module Serial Number Photo" in c)
+                    inverter_count = sum(1 for c in columns if "Inverter Serial Number Photo" in c or "Inverter Serial Number Image" in c)
                     
-                    # Flatten top-level keys for summary
-                    summary_data = {k:v for k,v in res.items() if k not in excluded_meta and not isinstance(v, (dict, list))}
+                    st.info(f"• Found {module_count} Module Photo Series\n• Found {inverter_count} Inverter Photo Series")
                     
-                    if summary_data:
-                        cols = st.columns(2)
-                        for idx, (k, v) in enumerate(summary_data.items()):
-                            cols[idx % 2].text_input(k.replace('_', ' ').title(), str(v), key=f"sum_{k}")
+                    col_map = {'type': 'solar_audit'}
+                    
+                else:
+                    mode = "standard"
+                    st.info("ℹ️ **Detected: Standard Batch Analysis**")
+                    
+                    # 2. HEURISTIC IMAGE COLUMN DETECTION
+                    detected_img_col = None
+                    sample = df_preview.head(5)
+                    
+                    for col in columns:
+                        try:
+                            sample_vals = sample[col].astype(str).tolist()
+                            for val in sample_vals:
+                                if "drive.google.com" in val or "http" in val:
+                                    detected_img_col = col
+                                    break
+                            if detected_img_col: break
+                        except:
+                            continue
+                    
+                    if not detected_img_col:
+                        keywords = ["image", "link", "url", "drive", "photo", "picture"]
+                        for col in columns:
+                            if any(k in col.lower() for k in keywords):
+                                detected_img_col = col
+                                break
+                    
+                    if not detected_img_col:
+                        detected_img_col = columns[0]
+                        st.warning(f"⚠️ Could not auto-detect image column. Defaulting to '{detected_img_col}'. Ensure links are present.")
                     else:
-                        st.info("No top-level summary fields found. Check 'Deep Structure' for nested data.")
+                        st.success(f"🔗 **Targeting Image Column:** `{detected_img_col}`")
 
-                with tab2:
-                    st.caption("Hierarchical view of complex document structures (Tables, Nested Groups).")
-                    
-                    # Recursive Renderer
-                    def render_recursive(data, parent_key="root", level=0):
-                        if isinstance(data, dict):
-                            for k, v in data.items():
-                                if k in excluded_meta: continue
-                                label = k.replace('_', ' ').title()
-                                current_key = f"{parent_key}_{k}"
-                                
-                                if isinstance(v, (dict, list)):
-                                    with st.expander(f"📂 {label}", expanded=(level==0)):
-                                        render_recursive(v, current_key, level+1)
-                                else:
-                                    st.text_input(label, str(v), key=f"deep_{current_key}")
-                                    
-                        elif isinstance(data, list):
-                            for i, item in enumerate(data):
-                                st.markdown(f"**Item {i+1}**")
-                                render_recursive(item, f"{parent_key}_{i}", level+1)
-                                st.divider()
+                    col_map = {
+                        'type': 'standard',
+                        'img': detected_img_col,
+                        'human': 'Human Detected',
+                        'remarks': 'AI Remarks',
+                        'data': 'Extracted Data'
+                    }
 
-                    render_recursive(res)
+            st.markdown("---")
+            
+            # Preview Data
+            with st.expander("👀 Data Preview (First 5 Rows)", expanded=False):
+                st.dataframe(df_preview.head())
 
-                with tab3:
-                    st.caption("Raw API response for debugging or downstream integration.")
-                    st.json(res)
-                    
-                    # Download Button
+            # Action Button
+            if st.button("🚀 Start Processing", type="primary", use_container_width=True):
+                 output_path = process_batch(uploaded_file, api_key, selected_model, col_map)
+                 
+                 if output_path:
+                    with open(output_path, "rb") as f:
+                        file_data = f.read()
+                        
                     st.download_button(
-                        label="⬇️ Download JSON Report",
-                        data=json.dumps(res, indent=2),
-                        file_name=f"audit_report_{st.session_state.timestamp}.json",
-                        mime="application/json",
+                        label="⬇️ Download Processed Report",
+                        data=file_data,
+                        file_name=f"processed_{uploaded_file.name}",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True
                     )
-
-        else:
-            # Empty State
-            st.info("👈 **Start Here:** Upload a document or image to begin forensic analysis.")
-            st.markdown(
-                """
-                <div style="padding: 2rem; background: rgba(255,255,255,0.03); border-radius: 10px; border: 1px dashed rgba(255,255,255,0.1); display: flex; align-items: center; justify-content: center; height: 200px;">
-                    <h4 style="margin:0; color: #a0aec0;">Awaiting Document Upload</h4>
-                </div>
-                """, 
-                unsafe_allow_html=True
-            )
+                    
+                    # Cleanup Output
+                    try:
+                        os.remove(output_path)
+                    except:
+                        pass
+                    
+        except Exception as e:
+            st.error(f"Error reading Excel file: {e}")
 
     # Footer
     st.markdown(FOOTER_STYLE, unsafe_allow_html=True)

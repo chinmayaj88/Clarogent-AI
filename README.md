@@ -1,79 +1,81 @@
-# 🦅 Clarogent: Universal AI Document & Audit Intelligence
+# 🦅 Clarogent: AI-Powered Batch Document Intelligence
 
-**Clarogent** is an AI forensics platform built to automate field audits, document verification, and asset intelligence.
+**Clarogent** is an enterprise-grade AI forensics platform designed for high-volume document processing and field audit intelligence.
 
-Architected to meet the high-precision standards of the **Solar Industry**, Clarogent goes beyond generic OCR to handle the specific constraints of field operations. Whether capturing technical specifications from solar panel labels under harsh glare or verifying installer safety compliance, the system is tuned for industrial-grade accuracy while maintaining universal applicability for field documents.
+Unlike traditional OCR tools that require templates, Clarogent uses **Llama 3.2 90B Vision** on **Groq Cloud** to dynamically understand and extract structured data from thousands of images instantly. It is specifically optimized for processing Google Drive links in bulk from Excel sheets.
 
-Powered by **Groq Cloud** and **Llama 4 Maverick Vision**, it delivers millisecond-latency OCR and scene understanding, instantly digitizing unique assets alongside standard government IDs (Aadhaar, PAN, Vehicle RC).
-
-[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://clarogent-ai.streamlit.app/)
+![Batch Processor](https://img.shields.io/badge/Clarogent-Batch_AI-blue?style=for-the-badge&logo=python)
 
 ---
 
 ## 🚀 Key Features
 
-### 1. ⚡ Ultra-Fast Vision Engine
+### 1. ⚡ High-Volume Batch Processing
 
-- Uses **meta-llama/llama-4-maverick-17b-128e-instruct** on Groq's LPU Inference Engine.
-- Parses complex documents in <1.5 seconds.
+- **Excel-Driven Workflow**: Upload an `.xlsx` file containing Google Drive image links.
+- **Smart Column Mapping**: Automatically detects and maps your Excel columns to the AI engine.
+- **Real-Time Progress**: Watch as the AI processes each row, updating status and error logs instantly.
 
-### 2. 📄 Universal Document Parsing
+### 2. 🧠 Advanced Vision capabilities
 
-- **No Templates Required**: The AI dynamically discovers fields.
-- **Smart Classification**: Auto-detects if an image is a Solar Panel, Vehicle RC, Aadhaar, or Invoice.
-- **Deep Extraction**: Captures nested details like `technical_specs` (Pmax, Voc, Isc for solar modules) and `vehicle_details`.
+- **Universal Extraction**: Extracts key-value pairs from any document type (Invoices, IDs, Solar Labels) without training.
+- **Human Detection**: Automatically flags images containing people for compliance or privacy audits.
+- **Quality Analysis**: Identifies blurry, low-light, or irrelevant images and provides actionable remarks.
 
-### 3. 👥 Field Intelligence
+### 3. 🛡️ Enterprise-Ready
 
-- **Human Detection**: Instantly counts personnel in a scene for compliance (e.g., "2 Installers Detected").
-- **Safety Compliance**: Real-time verification of installer PPE (hard hats, vests) for on-site safety audits.
+- **Secure Handling**: Processes images in-memory without storing sensitive data permanently.
+- **Rate Limiting**: Built-in exponential backoff handles API limits gracefully.
+- **Detailed Reporting**: Generates a comprehensive Excel report with extracted JSON data and AI insights.
 
 ---
 
-## 🛠️ Installation & Setup
+## 🛠️ Usage Guide
 
-### Prerequisites
+### prerequisites
 
-- Python 3.10+
-- A free API Key from [Groq Console](https://console.groq.com/keys)
+1. **Python 3.10+**
+2. **Groq API Key**: Get one for free at [Groq Console](https://console.groq.com/keys).
+3. **Google Drive Images**: Ensure your image links are set to **"Anyone with the link"** (Public) so the AI can access them.
 
 ### Quick Start
 
-1. **Clone the Repository**
+1. **Clone & Install**
 
    ```bash
    git clone https://github.com/yourusername/clarogent.git
    cd clarogent
-   ```
-
-2. **Run Setup Script (Windows)**
-   This script automatically:
-   - Creates a virtual environment (`venv`) using your system Python.
-   - Installs all dependencies.
-   - Launches the dashboard.
-
-   ```powershell
    .\setup.bat
    ```
 
-3. **Configure API Key**
-   - Create a `.env` file in the root directory:
-     ```env
-     GROQ_API_KEY=gsk_your_key_here...
-     ```
-   - _Alternatively, enter the key in the sidebar when the app runs._
+2. **Prepare Your Data**
+   - Create a Google Sheet with your image links.
+   - **Download it as an Excel file (.xlsx)**.
+   - Example Columns: `Image Link`, `Human Detected`, `AI Remarks`, `Extracted Data`.
+
+3. **Run the Application**
+
+   ```powershell
+   streamlit run app.py
+   ```
+
+4. **Process & Download**
+   - Upload your Excel file.
+   - Map the columns in the sidebar.
+   - Click **Start Batch Processing**.
+   - Download the final report when done!
 
 ---
 
 ## 🏗️ Technical Architecture
 
-| Component      | Technology   | Description                                          |
-| -------------- | ------------ | ---------------------------------------------------- |
-| **Frontend**   | Streamlit    | Responsive, real-time reactive dashboard.            |
-| **AI Brain**   | Llama Vision | 17B parameter model for high-fidelity OCR.           |
-| **Inference**  | Groq Cloud   | LPU-based acceleration for instant token generation. |
-| **Resilience** | Tenacity     | Exponential backoff for robust API handling.         |
+| Component     | Technology      | Description                                                     |
+| :------------ | :-------------- | :-------------------------------------------------------------- |
+| **Frontend**  | Streamlit       | Reactive web interface for file handling and real-time updates. |
+| **Engine**    | Python + Pandas | Core logic for batch processing, data mapping, and export.      |
+| **AI Model**  | Llama 3.2 90B   | State-of-the-art vision model for deep document understanding.  |
+| **Inference** | Groq LPU        | Ultra-low latency inference for rapid batch processing.         |
 
 ---
 
-_Built with ❤️ for the Future of AI Auditing._
+_Built for the Future of AI Automation._
