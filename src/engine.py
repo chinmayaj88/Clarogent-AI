@@ -11,6 +11,8 @@ from groq import Groq, RateLimitError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+import io
 
 # Configure Enterprise Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -39,6 +41,41 @@ class SolarVisionEngine:
         """Optimized Base64 encoding for image payloads."""
         with open(image_path, "rb") as image_file:
             return base64.b64encode(image_file.read()).decode('utf-8')
+
+    def _preprocess_forensic(self, image_path: str) -> str:
+        """
+        Forensic Image Enhancement for Serial Number Extraction.
+        Applies: Grayscale -> High Contrast -> Sharpening
+        """
+        try:
+            with Image.open(image_path) as img:
+                # 0. Handle EXIF Rotation (Crucial for mobile uploads)
+                img = ImageOps.exif_transpose(img)
+                
+                # 1. Convert to Grayscale to remove color noise
+                img = img.convert('L')
+                
+                # 2. Enhance Contrast (Make text blacker against background)
+                enhancer = ImageEnhance.Contrast(img)
+                img = enhancer.enhance(2.0)  # Double the contrast
+                
+                # 3. Enhance Sharpness (Define edges of digits)
+                enhancer = ImageEnhance.Sharpness(img)
+                img = enhancer.enhance(2.0)  # Significant sharpening
+                
+                # 4. Resize if too small (width < 1000px) for better OCR
+                if img.width < 1000:
+                    ratio = 1000 / img.width
+                    new_size = (1000, int(img.height * ratio))
+                    img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+                # Convert to base64
+                buffered = io.BytesIO()
+                img.save(buffered, format="JPEG", quality=95)
+                return base64.b64encode(buffered.getvalue()).decode('utf-8')
+        except Exception as e:
+            logger.warning(f"Preprocessing failed: {e}. Falling back to raw image.")
+            return self._encode_image(image_path)
 
     @retry(
         retry=retry_if_exception_type(RateLimitError),
@@ -136,16 +173,26 @@ class SolarVisionEngine:
         Focuses ONLY on alphanumeric sequences, ignoring technical specs.
         """
         try:
-            base64_image = self._encode_image(image_path)
+            # Switch to Forensic Preprocessing to enhance contrast/sharpness for digit accuracy
+            base64_image = self._preprocess_forensic(image_path)
             
             # Focused Serial Number Prompt
             system_prompt = (
                 f"Your Task: Extract the SERIAL NUMBER from this {asset_type} photo.\n"
-                "Target: A unique alphanumeric string identifying this specific unit.\n"
+                "CRITICAL: ACCURACY IS PARAMOUNT. DO NOT OMIT ANY DIGITS/CHARACTERS.\n\n"
+                "Target: A unique alphanumeric string identifying this specific unique unit.\n"
+                "Characteristics:\n"
+                "1. LENGTH: Usually 14-24 characters long (often ~16 chars). If you find a short string (e.g., 4-8 chars), it is likely a model number or date code, NOT the serial.\n"
+                "2. FORMAT: Alphanumeric.\n"
+                "3. LOCATION: Often below/next to a barcode or QR code.\n"
+                "4. ORIENTATION: Often VERTICAL (rotated 90°). You MUST be able to read text running bottom-to-top or top-to-bottom.\n"
+                "5. CONTEXT: Serial numbers are often STANDALONE strings (no label), whereas Model Numbers usually have a 'Model No:' label.\n\n"
                 "Rules:\n"
-                "- IGNORE: Model numbers (e.g., 'JKM545M'), electrical ratings (e.g., '545W', '1500V').\n"
-                "- IGNORE: Date codes or manufacturer addresses.\n"
-                "- FORMAT: Return ONLY the raw serial number string. No JSON. No markdown. No labels like 'Serial:'.\n"
+                "- VERIFY EVERY CHARACTER: Treat this as a forensic extraction. Missing a single digit is a failure.\n"
+                "- CHECK ROTATION: If you see vertical text, read it carefully.\n"
+                "- IGNORE: Model numbers (e.g., 'JKM545M', 'CS3W'), electrical ratings (e.g., '545W', '1500V').\n"
+                "- IGNORE: Date codes (e.g., '2023-05') or manufacturer addresses.\n"
+                "- OUTPUT FORMAT: Return ONLY the raw serial number string. No JSON. No markdown. No labels like 'Serial:'.\n"
                 "- If unreadable/missing, return 'N/A'."
             )
 
