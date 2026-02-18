@@ -301,9 +301,6 @@ class BatchProcessor:
         # Thread Safety Lock for concurrent writes
         self.write_lock = threading.Lock()
         
-        # Connection Pool Session for faster downloads
-        self.session = requests.Session()
-        
         # Load Excel with Pandas for processing logic
         try:
             self.df = pd.read_excel(excel_path)
@@ -395,11 +392,11 @@ class BatchProcessor:
         return None
 
     def _download_image(self, drive_id: str, save_path: str) -> bool:
-        """Downloads image from Google Drive using ID and Connection Pooling."""
+        """Downloads image from Google Drive using ID."""
         url = f"https://drive.google.com/uc?export=download&id={drive_id}"
         try:
-            # Use self.session for pooled connection
-            response = self.session.get(url, stream=True, timeout=10)
+            # Direct request to avoid pool locking in threads
+            response = requests.get(url, stream=True, timeout=15)
             if response.status_code == 200:
                 with open(save_path, 'wb') as f:
                     for chunk in response.iter_content(1024):
@@ -447,9 +444,18 @@ class BatchProcessor:
                 return False
                 
             test_path = f"temp_{asset_type.replace(' ','_')}_{index}.jpg"  
+            t0 = time.time()
             try:
                 if self._download_image(drive_id, test_path):
+                    t1 = time.time()
+                    # logger.info(f"Row {index}: Download took {t1-t0:.2f}s")
+                    
                     serial = self.engine.extract_serial_only(test_path, asset_type)
+                    t2 = time.time()
+                    
+                    # Log timing to callback if possible, or just debug
+                    # logger.info(f"Row {index}: AI took {t2-t1:.2f}s")
+
                     with self.write_lock:
                         self.df.at[index, target_col] = serial
                     self._update_xl(index, target_col, serial)

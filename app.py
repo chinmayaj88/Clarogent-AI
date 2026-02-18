@@ -144,8 +144,8 @@ def process_batch_logic(uploaded_file, api_key: str, model_id: str, col_map: dic
                 return False
 
         # --- PARALLEL EXECUTION LOOP ---
-        # Increased to 20 workers for maximum I/O throughput
-        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        # Reduced to 5 workers to avoid Rate Limit Throttling (Quality > Throughput)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             futures = [executor.submit(process_wrapper, idx, row) for idx, row in processor.df.iterrows()]
             
             completed = 0
