@@ -1,0 +1,77 @@
+# 🦅 Clarogent: Universal AI Document & Audit Intelligence
+
+**Clarogent** is an AI forensics platform built to automate field audits, document verification, and asset intelligence.
+
+Powered by **Groq Cloud** and **Llama 4 Maverick Vision**, it delivers millisecond-latency OCR and scene understanding, capable of instantly digitizing everything from solar panel labels to complex government IDs (Aadhaar, PAN, Vehicle RC).
+
+[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://clarogent-ai.streamlit.app/)
+
+---
+
+## 🚀 Key Features
+
+### 1. ⚡ Ultra-Fast Vision Engine
+
+- Uses **meta-llama/llama-4-maverick-17b-128e-instruct** on Groq's LPU Inference Engine.
+- Parses complex documents in <1.5 seconds.
+
+### 2. 📄 Universal Document Parsing
+
+- **No Templates Required**: The AI dynamically discovers fields.
+- **Smart Classification**: Auto-detects if an image is a Solar Panel, Vehicle RC, Aadhaar, or Invoice.
+- **Deep Extraction**: Captures nested details like `vehicle_details`, `owner_address`, and `technical_specs`.
+
+### 3. 👥 Field Intelligence
+
+- **Human Detection**: Instantly counts personnel in a scene for compliance (e.g., "2 Installers Detected").
+- **Safety Compliance**: verifying if PPE (hard hats) is visible (implicit via prompt).
+
+---
+
+## 🛠️ Installation & Setup
+
+### Prerequisites
+
+- Python 3.10+
+- A free API Key from [Groq Console](https://console.groq.com/keys)
+
+### Quick Start
+
+1. **Clone the Repository**
+
+   ```bash
+   git clone https://github.com/yourusername/clarogent.git
+   cd clarogent
+   ```
+
+2. **Run Setup Script (Windows)**
+   This script automatically:
+   - Creates a virtual environment (`venv`) using your system Python.
+   - Installs all dependencies.
+   - Launches the dashboard.
+
+   ```powershell
+   .\setup.bat
+   ```
+
+3. **Configure API Key**
+   - Create a `.env` file in the root directory:
+     ```env
+     GROQ_API_KEY=gsk_your_key_here...
+     ```
+   - _Alternatively, enter the key in the sidebar when the app runs._
+
+---
+
+## 🏗️ Technical Architecture
+
+| Component      | Technology   | Description                                          |
+| -------------- | ------------ | ---------------------------------------------------- |
+| **Frontend**   | Streamlit    | Responsive, real-time reactive dashboard.            |
+| **AI Brain**   | Llama Vision | 17B parameter model for high-fidelity OCR.           |
+| **Inference**  | Groq Cloud   | LPU-based acceleration for instant token generation. |
+| **Resilience** | Tenacity     | Exponential backoff for robust API handling.         |
+
+---
+
+_Built with ❤️ for the Future of AI Auditing._
